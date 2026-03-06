@@ -1,0 +1,12 @@
+# GUI Framework
+wxPython==4.2.3
+
+# PDF Processing & Analysis
+pdfplumber==0.11.8
+pdfminer.six==20251107
+
+# System Utilities
+psutil==7.0.0
+
+# Numerical Computing (Vectorized Operations)
+numpy==2.2.6
