@@ -45,11 +45,11 @@ This I have created with my brain and the help of Ai, Iam not a coder... sorry s
 It is really hard for me with GUI and the Function and in addition to compile it.<br>
 For the python-file oc you need to import missing libraries.<br>
 <br><br>
-INSTALL:
-python -m venv venv
-venv\Scripts\activate  # On Windows
-pip install -r requirements.txt
-python version_xyz.py
+INSTALL:<br>
+python -m venv venv<br>
+venv\Scripts\activate  # On Windows<br>
+pip install -r requirements.txt<br>
+python version_xyz.py<br><br>
 
 
 <b>now have fun and leave a comment if you like  ;)</b><br>
