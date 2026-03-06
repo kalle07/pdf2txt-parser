@@ -25,7 +25,7 @@ Therefore its better to convert it with some help of a <b>parser</b>.<br>
 I work with "<b>pdfplumber/pdfminer</b>" none OCR(no images) and the PDF must contain copyable text.<br>
 <ul style="line-height: 1.05;">
 <li>Works with single and multi PDF list, works with folder</li>
-<li>Intelligent multiprocessing ~10-20 pages per second</li>
+<li>Intelligent multiprocessing ~10-30 pages per second</li>
 <li>Error tolerant, that means if your PDF is not convertible, it will be skipped, no special handling</li>
 <li>Instant view of the result, hit one pdf on top of the list</li>
 <li>Removes about 5% of the margins around the page</li>
@@ -44,13 +44,13 @@ I work with "<b>pdfplumber/pdfminer</b>" none OCR(no images) and the PDF must co
 This I have created with my brain and the help of Ai, Iam not a coder... sorry so I will not fulfill any wishes unless there are real errors.<br>
 It is really hard for me with GUI and the Function and in addition to compile it.<br>
 For the python-file oc you need to import missing libraries.<br>
-<br>
-I also have a "<b>docling</b>" parser with OCR (GPU is need for fast processing), its only be a python-file, not compiled.<br>
-You have to download all libs, and if you start (first time) internal also OCR models are downloaded. At the moment i have prepared a kind of multi docling, 
-the number of parallel processes depend on VRAM and if you use OCR only for tables or for all. I have set VRAM = 16GB (my GPU RAM, you should set yours) and the multiple calls for docling are VRAM/1.3, 
-so it uses ~12GB (in my version) and processes 12 PDFs at once, only txt and tables are converted, so no images no diagrams. For now all PDFs must be same folder like the python file. 
-If you change OCR for all the VRAM consum is rasing you have to set 1.3 to 2 or more.
 <br><br>
+INSTALL:
+python -m venv venv
+venv\Scripts\activate  # On Windows
+pip install -r requirements.txt
+python version_xyz.py
+
 
 <b>now have fun and leave a comment if you like  ;)</b><br>
 on discord "sevenof9"
