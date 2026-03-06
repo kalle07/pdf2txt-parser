@@ -20,7 +20,6 @@ from pdfminer.pdfparser import PDFParser, PDFSyntaxError
 from pdfminer.pdfdocument import PDFDocument, PDFEncryptionError, PDFPasswordIncorrect
 from pdfminer.pdfpage import PDFPage, PDFTextExtractionNotAllowed
 from pdfminer.pdfinterp import PDFResourceManager
-from rtree import index
 import numpy as np
 
 # Concurrency
@@ -1196,5 +1195,6 @@ def main():
 if __name__ == "__main__":
     multiprocessing.freeze_support()
     main()
+
 
 
