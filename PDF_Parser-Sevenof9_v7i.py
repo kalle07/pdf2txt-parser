@@ -772,10 +772,10 @@ def report_status(tracker, progress_callback=None):
     if progress_callback:
         progress_callback(status)
     else:
-        print(f"[STATUS] {status['processed_pages']}/{status['total_pages']} Seiten "
-              f"({status['pages_per_sec']:} Seiten/s, "
-              f"Elapsed: {status['elapsed_time']} Sek.)"
-              f"Est Time: {status['est_time']} Sek.)")
+        print(f"[STATUS] {status['processed_pages']}/{status['total_pages']} pages "
+              f"({status['pages_per_sec']:} pages/s, "
+              f"Elapsed: {status['elapsed_time']} sec.)"
+              f"Est Time: {status['est_time']} sec.)")
 
 
 def save_pdf(path, page_number, tracker=None, parallel=False, progress_callback=None, stop_flag=None):
@@ -791,7 +791,7 @@ def save_pdf(path, page_number, tracker=None, parallel=False, progress_callback=
         results = run_serial_batched(path, page_number, tracker, progress_callback, stop_flag)
 
     # Filter and Sort
-    results = [r for r in results if r]  # Filter None (bei Stop)
+    results = [r for r in results if r]  # Filter None (on stop)
     results.sort(key=lambda x: x[0])     # Sort by page number
     
     text_output = "\n".join(text for _, text in results)
@@ -812,19 +812,19 @@ def _process_single_pdf(path):
             document = PDFDocument(parser)
 
             if not document.is_extractable:
-                raise PDFTextExtractionNotAllowed("Text-Extraktion nicht erlaubt")
+                raise PDFTextExtractionNotAllowed("Text extraction not allowed")
 
             pages = list(PDFPage.create_pages(document))
             return (path, len(pages), None)
 
     except (PDFEncryptionError, PDFPasswordIncorrect) as e:
-        return (path, 0, f"[ERROR] Datei passwortgeschützt: {path} ({type(e).__name__}: {e})\n")
+        return (path, 0, f"[ERROR] File password protected: {path} ({type(e).__name__}: {e})\n")
     except PDFSyntaxError as e:
-        return (path, 0, f"[ERROR] Ungültige PDF-Syntax: {path} ({type(e).__name__}: {e})\n")
+        return (path, 0, f"[ERROR] Invalid PDF syntax: {path} ({type(e).__name__}: {e})\n")
     except PDFTextExtractionNotAllowed as e:
-        return (path, 0, f"[ERROR] Text-Extraktion nicht erlaubt: {path} ({type(e).__name__}: {e})\n")
+        return (path, 0, f"[ERROR] Text extraction not allowed: {path} ({type(e).__name__}: {e})\n")
     except Exception as e:
-        return (path, 0, f"[ERROR] Fehler bei Datei {path}: {type(e).__name__}: {e}\n")
+        return (path, 0, f"[ERROR] Error in file {path}: {type(e).__name__}: {e}\n")
 
 def get_total_pages(pdf_files, error_callback=None, progress_callback=None):
     suppress_pdfminer_logging()
@@ -842,7 +842,7 @@ def get_total_pages(pdf_files, error_callback=None, progress_callback=None):
             page_info.append((path, count))
             total += count
             if progress_callback:
-                progress_callback(total)  # Rückmeldung an GUI
+                progress_callback(total)  # Feedback to GUI
 
     if len(pdf_files) > 16:
         with concurrent.futures.ProcessPoolExecutor(max_workers=cores) as executor:
@@ -876,7 +876,7 @@ class FileManager(wx.Frame):
         lbl1 = wx.StaticText(panel, label="PDF files: (with right mouse you can remove and open)")
         hbox_lbl1.Add(lbl1, flag=wx.ALIGN_CENTER_VERTICAL | wx.LEFT, border=10)
 
-        hbox_lbl1.AddStretchSpacer()  # <== schiebt den Button ganz nach rechts
+        hbox_lbl1.AddStretchSpacer()  # <== pushes the button all the way to the right
 
         help_btn = wx.Button(panel, label="? HELP ?", size=(60, 25))
         help_btn.Bind(wx.EVT_BUTTON, self.ShowHelpText)
@@ -917,7 +917,7 @@ class FileManager(wx.Frame):
                 btn.SetBackgroundColour(wx.Colour(255, 180, 180))  # light red
             elif label == "Start Parser":
                 btn.SetBackgroundColour(wx.Colour(180, 255, 180))  # light green
-                self.start_btn = btn  # <-- Referenz merken
+                self.start_btn = btn  # <-- save reference
             btn_sizer.Add(btn, proportion=1, flag=wx.ALL, border=5)
         btn_panel.SetSizer(btn_sizer)
         vbox.Add(btn_panel, flag=wx.EXPAND | wx.LEFT | wx.RIGHT, border=10)
@@ -930,7 +930,7 @@ class FileManager(wx.Frame):
         self.ShowHelpText(None)
         vbox.Add(self.text_ctrl, proportion=1, flag=wx.EXPAND | wx.LEFT | wx.RIGHT, border=10)
 
-        # Statusanzeige
+        # Status display
         stat_grid = wx.FlexGridSizer(1, 5, 5, 55)
         self.lbl_processed_pages = wx.StaticText(panel, label="Processed pages: 0")
         self.lbl_total_pages = wx.StaticText(panel, label="Total pages: 0")
@@ -1048,8 +1048,8 @@ class FileManager(wx.Frame):
 
     def StartParser(self, event):
         if not self.files:
-            wx.MessageBox("Please select files first.", "Hinweis", wx.OK | wx.ICON_INFORMATION)
-            wx.CallAfter(self.start_btn.Enable)  # <-- wieder aktivieren
+            wx.MessageBox("Please select files first.", "Note", wx.OK | wx.ICON_INFORMATION)
+            wx.CallAfter(self.start_btn.Enable)  # <-- re-enable
             return
 
 
@@ -1072,7 +1072,7 @@ class FileManager(wx.Frame):
 
         if total_pages == 0:
             self.AppendProg("[INFO] No pages found.\n")
-            wx.CallAfter(self.start_btn.Enable)  # <-- wieder aktivieren
+            wx.CallAfter(self.start_btn.Enable)  # <-- re-enable
             return
 
         tracker = StatusTracker(total_pages)
@@ -1090,7 +1090,7 @@ class FileManager(wx.Frame):
             small = [p for p in page_info if p[1] <= PARALLEL_THRESHOLD]
             large = [p for p in page_info if p[1] > PARALLEL_THRESHOLD]
 
-            # Verarbeite kleine Dateien je in einem eigenen Prozess
+            # Process small files each in their own process
             if small:
                 max_workers = max(1, min(len(small), get_physical_cores()))
                 with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
@@ -1109,11 +1109,11 @@ class FileManager(wx.Frame):
                             pages_processed = future.result()
                             tracker.update(pages_processed)
                             throttled_gui_callback(tracker.get_status())
-                            wx.CallAfter(self.AppendProg, f"[INFO] File ready: {path} ({pages_processed} Seiten)\n")
+                            wx.CallAfter(self.AppendProg, f"[INFO] File ready: {path} ({pages_processed} pages)\n")
                         except Exception as e:
                             wx.CallAfter(self.AppendProg, f"[ERROR] File {path}: {str(e)}\n")
 
-            # Verarbeite große Dateien Seite für Seite parallel
+            # Process large files page by page in parallel
             for path, count in large:
                 if self.stop_flag.is_set():
                     break
@@ -1130,7 +1130,7 @@ class FileManager(wx.Frame):
                     if pages_processed:
                         wx.CallAfter(
                             self.AppendProg,
-                            f"[INFO] File ready: {path} ({pages_processed} Seiten)\n"
+                            f"[INFO] File ready: {path} ({pages_processed} pages)\n"
                         )
                     else:
                         wx.CallAfter(
@@ -1146,7 +1146,7 @@ class FileManager(wx.Frame):
 
 
             wx.CallAfter(self.AppendProg, "\n[INFO] Processing completed.\n")
-            wx.CallAfter(self.start_btn.Enable)  # <-- wieder aktivieren
+            wx.CallAfter(self.start_btn.Enable)  # <-- re-enable
             self.stop_flag.clear()
 
         threading.Thread(target=background, daemon=True).start()
@@ -1173,7 +1173,7 @@ class FileManager(wx.Frame):
         self.prog_ctrl.AppendText(text)
 
 
-# -------------------- Einstiegspunkt --------------------
+# -------------------- Entry Point --------------------
 def main():
     if len(sys.argv) > 1:
         pdf_files = sys.argv[1:]
