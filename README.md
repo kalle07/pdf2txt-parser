@@ -1,7 +1,7 @@
 # parsing / pdf parser
 with GUI<br>
 update: 03/26 <b>PDF_Parser-Sevenof9_v7i</b>, again 25% faster through page chunking for each core<br>
-Check the PDF before converting it to text: go to any page, ideally one at the beginning and one at the end, select the text with the mouse and copy it into an editor (can you see what you copied?)... if that doesn't work, this parser won't work and neither will any other program! To do this, you must remove the copy protection, or the page is just an image and you must use OCR first.<br>
+Check the PDF before converting it to text: go to any page, ideally one at the beginning and one at the end, select the text with the mouse and copy it into an editor (can you see what you copied?)... if that doesn't work, this parser won't work and neither will any other simple program! To do this, you must remove the copy protection, or the page is just an image and you must use OCR first.<br>
 
 # <b>PDF to TXT converter ready to chunk for your RAG</b>
 <b>EXE- ONLY WINDOWS</b><br>
