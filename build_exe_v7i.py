@@ -1,8 +1,8 @@
 import sys
 import subprocess
 
-# Hier wird der Pfad zum Entry-Point (dein Skript) definiert
-entry_point = "PDF_Parser-Sevenof9_v7i.py"  # Passe dies nach Bedarf an
+# Define the path to the entry point (your script) here
+entry_point = "PDF_Parser-Sevenof9_v7i.py"  # Adjust this as needed
 
 
 # Der Befehl, der an PyInstaller übergeben wird
@@ -11,7 +11,7 @@ cmd = [
     "--onefile",
     "--noconfirm",
     "--clean",
-    "--noconsole",  # Keine Konsole anzeigen (wichtig für GUI-Programme)
+    "--noconsole",  # Do not show console (important for GUI programs)
     
     # External dependencies that need explicit hidden imports
     "--hidden-import", "pdfminer.six",
@@ -36,6 +36,6 @@ cmd = [
 
 try:
     subprocess.run(cmd, check=True)
-    print("Kompilierung abgeschlossen.")
+    print("Compilation complete.")
 except subprocess.CalledProcessError as e:
-    print(f"Fehler bei der Kompilierung: {e}")
+    print(f"Compilation error: {e}")
