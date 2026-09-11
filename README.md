@@ -5,6 +5,11 @@
 or: https://github.com/kalle07/pdf2txt-parser/releases/download/V8a/PDFParser-by-kalle07.exe
 <br>
 <br>
+📥 Downloads: <!--download-count-->043<!--/download-count-->
+
+
+<br>
+<br>
 <b>The PDF Parser is a high-performance desktop application for extracting text, images, drawings, and metadata from PDF documents. Built for speed with multi-core processing and batch conversion, it helps researchers, engineers, businesses, and developers convert large PDF collections into clean, searchable text while preserving valuable document information.<br>
 
 The parser can also save extracted images and vector drawings as separate files. Using an external application (eg: small VL model like LFM25), these images and drawings can be automatically described, and the generated descriptions can then be injected back into the main extracted text file. This creates enriched, AI-ready documents that combine the original PDF text with meaningful descriptions of visual content, making them ideal for search, indexing, accessibility, and retrieval-augmented generation (RAG) workflows. </b><br><br>
@@ -89,11 +94,7 @@ When processing large amounts of data, the following should be noted:<br>
 6. Speed: 8 cores  ~50 pages / sec<br><br>
 
 ...<br>
-<br>
-📥 Downloads: <!--download-count-->043<!--/download-count-->
 
-
-<br>
 <br>
 This I have created with my brain and the help of Ai, Iam not a coder... sorry so I will not fulfill any wishes unless there are real errors.<br>
 It is really hard for me with GUI and the Function and in addition to compile it.<br>
