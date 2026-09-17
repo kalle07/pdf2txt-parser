@@ -5,7 +5,7 @@
 or: https://github.com/kalle07/pdf2txt-parser/releases/download/V8a/PDFParser-by-kalle07.exe
 <br>
 <br>
-📥 Downloads: <!--download-count-->044<!--/download-count-->
+📥 Downloads: <!--download-count-->045<!--/download-count-->
 
 
 <br>
