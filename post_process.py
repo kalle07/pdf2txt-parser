@@ -11,7 +11,7 @@ logger = logging.getLogger("pdf_parser.post_process")
 # Default JSON keys whose list items receive descriptions. OCR (or any other
 # pipeline) can pass its own keys so the same post-processor can be reused by
 # searching for a different phrase.
-DEFAULT_TARGET_KEYS = ("drawings_with_resolution", "images_with_resolution")
+DEFAULT_TARGET_KEYS = ("drawings_with_resolution", "images_with_resolution", "formulas_on_page")
 
 
 def remove_nonprintable_chars(text: str) -> str:

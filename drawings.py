@@ -67,26 +67,40 @@ class DrawingExtractor:
 
         # Retrieve already clustered drawing groups from the page.
         drawing_clusters = list(page.cluster_drawings()) if page.cluster_drawings() else []
-        all_clusters = list(drawing_clusters)
 
-        # If small text blocks should be included, append them to the cluster list.
+        cluster_items: List[Dict[str, Any]] = [
+            {
+                "bbox": tuple(float(v) for v in bbox),
+                "type": "drawing",
+            }
+            for bbox in drawing_clusters
+        ]
+
+        # Small text blocks are first-class merge items, just like drawing clusters.
         if self.config.include_small_text_blocks:
             blocks = page.get_text("blocks")
             small_blocks = self._get_small_text_blocks(blocks)
-            if small_blocks:
-                all_clusters.extend(small_blocks)
-                small_text_blocks_merged = len(small_blocks)
+            cluster_items.extend(
+                {
+                    "bbox": tuple(float(v) for v in bbox),
+                    "type": "small_text",
+                }
+                for bbox in small_blocks
+            )
 
         # Early exit if no clusters remain after filtering.
-        if not all_clusters:
-            return drawing_list, valid_drawing_count, small_text_blocks_merged
+        if not cluster_items:
+            return drawing_list, valid_drawing_count, 0
 
-        # Merge nearby clusters to reduce redundancy (e.g., fragments of a single drawing).
-        merged_clusters = self._merge_nearby_clusters(all_clusters)
+        # Merge nearby drawing clusters and small text blocks together.
+        merged_clusters = self._merge_nearby_clusters(cluster_items)
 
         # Cache expensive page calls once per page — reused across all clusters.
         page_drawings = page.get_drawings()
-        all_blocks = page.get_text("blocks") if self.config.include_small_text_blocks else []
+
+        # Pre-compute max allowed dimensions (80% of page width/height)
+        max_width = page.rect.width * 0.8
+        max_height = page.rect.height * 0.8
 
         # Process each merged cluster.
         for cluster_info in merged_clusters:
@@ -99,13 +113,16 @@ class DrawingExtractor:
                     stats.drawings_skipped_margin += 1
                 continue
 
-            # Count drawing rectangles and text blocks inside the cluster
-            # using the pre-fetched page data.
-            item_counts = self._count_cluster_items_cached(
-                page_drawings, all_blocks, cluster_bbox
-            )
-            drawing_items = item_counts["rectangles"]
-            text_blocks = item_counts["text_blocks"]
+            # NEW: Skip if drawing exceeds 80% of page width or height
+            if bbox_obj.width > max_width or bbox_obj.height > max_height:
+                if stats is not None:
+                    stats.drawings_skipped_size += 1
+                continue
+
+            # Count drawing rectangles inside the final merged bbox.
+            # Small text blocks are counted from the union-find membership
+            drawing_items = self._count_drawing_items_cached(page_drawings, cluster_bbox)
+            text_blocks = int(cluster_info["text_block_count"])
 
             # Enforce a minimum number of drawing items per cluster.
             if drawing_items < self.config.min_items_per_cluster:
@@ -157,7 +174,11 @@ class DrawingExtractor:
             )
             drawing_list.append(drawing_info)
 
+        # Count only small text blocks that were actually included in valid clusters.
+        small_text_blocks_merged = sum(d.text_blocks_included for d in drawing_list)
         return drawing_list, valid_drawing_count, small_text_blocks_merged
+
+    
 
     def save_all(self, drawings: List[DrawingInfo], page: pymupdf.Page):
         """Commit drawings to disk using the configured crop padding."""
@@ -189,7 +210,8 @@ class DrawingExtractor:
     def _get_small_text_blocks(self, blocks: List[Tuple]) -> List[Tuple[float, float, float, float]]:
         """Extract small text blocks that contain European/ASCII content.
         Only blocks whose non‑whitespace character count does not exceed the
-        configured ``small_text_max_chars`` are kept.
+        configured ``small_text_max_chars`` and whose area is at least 10 000 px²
+        are kept.
         """
         small_blocks = []
         for block in blocks:
@@ -199,11 +221,11 @@ class DrawingExtractor:
             bbox_tuple = (x0, y0, x1, y1)
 
             if text and count_non_whitespace_chars(text) <= self.config.small_text_max_chars:
-                if self._is_european_text(text):
-                    # Keep only blocks that pass the minimum size filter.
-                    if passes_size_filter(BoundingBox.from_tuple(bbox_tuple), self.config.min_block_size_px):
-                        small_blocks.append(bbox_tuple)
+                area = (x1 - x0) * (y1 - y0)
+                if area <= 500 and self._is_european_text(text): # min area used to avoiding large textblock becomming a drawing
+                    small_blocks.append(bbox_tuple)
         return small_blocks
+
 
     def _is_european_text(self, text: str) -> bool:
         """Return ``True`` if *text* consists mainly of European characters.
@@ -241,9 +263,19 @@ class DrawingExtractor:
         # Consider text "mainly" European if over 50% of characters match
         return european_count / len(text) > 0.5
 
-    def _merge_nearby_clusters(self, clusters: List[Tuple]) -> List[Dict[str, Any]]:
-        """Merge spatially close clusters using a Union‑Find structure with
-        a spatial sort + linear scan to avoid the O(n²) pairwise loop.
+
+    def _merge_nearby_clusters(self, clusters: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Merge spatially close drawing clusters and small text blocks.
+
+        Each input cluster is expected to have the form:
+
+            {
+                "bbox": (x0, y0, x1, y1),
+                "type": "drawing" | "small_text",
+            }
+
+        The method uses union-find so that nearby drawing clusters and small
+        text blocks are merged into one final drawing area.
         """
         if not clusters:
             return []
@@ -262,100 +294,122 @@ class DrawingExtractor:
             if px != py:
                 parent[px] = py
 
-        # Sort indices by x0 then y0 for spatial locality.
-        sorted_indices = sorted(range(n), key=lambda i: (clusters[i][0], clusters[i][1]))
+        bboxes: List[Tuple[float, float, float, float]] = [
+            tuple(float(v) for v in cluster["bbox"]) for cluster in clusters
+        ]
+        bbox_objs: List[BoundingBox] = [BoundingBox.from_tuple(bbox) for bbox in bboxes]
 
-        # Linear scan: only compare each cluster with its spatial neighbours.
-        # A cluster at sorted position j can only merge with clusters whose
-        # x0 is within tolerance. We keep a running window.
+        # Sort indices by x0 then y0 for spatial locality.
+        sorted_indices = sorted(range(n), key=lambda i: (bboxes[i][0], bboxes[i][1]))
+
         tolerance = self.config.cluster_merge_tolerance
+
+        # Linear scan over spatially nearby candidates.
         for i_idx in range(n):
-            i_sorted = sorted_indices[i_idx]
-            ix0, iy0, ix1, _ = clusters[i_sorted]
+            i_id = sorted_indices[i_idx]
+            ix0, iy0, ix1, _ = bboxes[i_id]
+
             for j_idx in range(i_idx + 1, n):
-                j_sorted = sorted_indices[j_idx]
-                jx0, jy0, jx1, _ = clusters[j_sorted]
+                j_id = sorted_indices[j_idx]
+                jx0, jy0, jx1, _ = bboxes[j_id]
+
                 # Early break: if j's x0 exceeds i's x1 + tolerance, no further
                 # clusters (sorted by x0) can be within distance.
                 if jx0 > ix1 + tolerance:
                     break
-                distance = calculate_bbox_distance(
-                    BoundingBox.from_tuple(clusters[i_sorted]),
-                    BoundingBox.from_tuple(clusters[j_sorted]),
-                )
+
+                # Check for proximity OR containment
+                should_merge = False
+
+                # 1. Standard proximity check
+                distance = calculate_bbox_distance(bbox_objs[i_id], bbox_objs[j_id])
                 if distance <= tolerance:
-                    union(i_sorted, j_sorted)
+                    should_merge = True
+
+                # 2. Containment check: Is center of i inside j, or center of j inside i?
+                if not should_merge:
+                    # Center of i in j?
+                    i_center_x = (bboxes[i_id][0] + bboxes[i_id][2]) / 2
+                    i_center_y = (bboxes[i_id][1] + bboxes[i_id][3]) / 2
+                    if (jx0 <= i_center_x <= jx1) and (jy0 <= i_center_y <= bboxes[j_id][3]):
+                        should_merge = True
+
+                    # Center of j in i?
+                    if not should_merge:
+                        j_center_x = (bboxes[j_id][0] + bboxes[j_id][2]) / 2
+                        j_center_y = (bboxes[j_id][1] + bboxes[j_id][3]) / 2
+                        if (ix0 <= j_center_x <= ix1) and (iy0 <= j_center_y <= bboxes[i_id][3]):
+                            should_merge = True
+
+                if should_merge:
+                    union(i_id, j_id)
 
         # Group indices by their root parent.
-        groups: Dict[int, List[Tuple]] = {}
+        groups: Dict[int, List[int]] = {}
         for i in range(n):
             root = find(i)
-            groups.setdefault(root, []).append(clusters[i])
+            groups.setdefault(root, []).append(i)
 
-        # Build the final merged representation.
-        result = []
-        for root, group in groups.items():
-            x0_min = min(c[0] for c in group)
-            y0_min = min(c[1] for c in group)
-            x1_max = max(c[2] for c in group)
-            y1_max = max(c[3] for c in group)
+        result: List[Dict[str, Any]] = []
+
+        for group_indices in groups.values():
+            x0_min = min(bboxes[i][0] for i in group_indices)
+            y0_min = min(bboxes[i][1] for i in group_indices)
+            x1_max = max(bboxes[i][2] for i in group_indices)
+            y1_max = max(bboxes[i][3] for i in group_indices)
+
+            text_block_count = sum(
+                1
+                for i in group_indices
+                if clusters[i].get("type") == "small_text"
+            )
+            drawing_cluster_count = len(group_indices) - text_block_count
+
             result.append(
                 {
                     "bbox": (x0_min, y0_min, x1_max, y1_max),
-                    "original_indices": [i for i, _ in enumerate(clusters) if find(i) == root],
-                    "cluster_count": len(group),
-                    "cluster_type": "drawing",
+                    "original_indices": group_indices,
+                    "cluster_count": len(group_indices),
+                    "drawing_cluster_count": drawing_cluster_count,
+                    "text_block_count": text_block_count,
                 }
             )
+
         return result
 
-    def _count_cluster_items_cached(
+
+
+
+    def _count_drawing_items_cached(
         self,
         drawings: List[Any],
-        blocks: List[Tuple],
         cluster_bbox: Tuple[float, float, float, float],
-    ) -> Dict[str, int]:
-        """Count drawing rectangles and small text blocks inside *cluster_bbox*.
-
-        Accepts pre‑fetched ``drawings`` and ``blocks`` lists (from
-        ``page.get_drawings()`` / ``page.get_text('blocks')``) so the expensive
-        page calls are made only once per page, not once per cluster.
-        """
+    ) -> int:
+        """Count drawing rectangles completely inside *cluster_bbox*."""
         x0, y0, x1, y1 = cluster_bbox
 
         rect_count = 0
-        text_block_count = 0
 
-        # Count full‑page rectangle drawings that are completely inside the cluster.
         for drawing in drawings:
-            if "rect" in drawing:
-                dr = drawing["rect"]
-                if hasattr(dr, "x0"):
-                    dr = (float(dr.x0), float(dr.y0), float(dr.x1), float(dr.y1))
-                elif isinstance(dr, (tuple, list)):
-                    dr = tuple(float(x) for x in dr)
+            if "rect" not in drawing:
+                continue
 
-                # Simple containment test.
-                if dr[0] >= x0 and dr[1] >= y0 and dr[2] <= x1 and dr[3] <= y1:
-                    rect_count += 1
+            dr = drawing["rect"]
 
-        # If small text inclusion is enabled, count qualifying text blocks.
-        if self.config.include_small_text_blocks and blocks:
-            for block in blocks:
-                if not block or len(block) < 5:
-                    continue
+            if hasattr(dr, "x0"):
+                dr = (float(dr.x0), float(dr.y0), float(dr.x1), float(dr.y1))
+            elif isinstance(dr, (tuple, list)):
+                dr = tuple(float(v) for v in dr)
+            else:
+                continue
 
-                x0_b, y0_b, x1_b, y1_b, text = block[:5]
-                # Containment check.
-                if x0_b >= x0 and y0_b >= y0 and x1_b <= x1 and y1_b <= y1:
-                    if text and count_non_whitespace_chars(text) <= 100:
-                        text_block_count += 1
+            # Simple containment test.
+            if dr[0] >= x0 and dr[1] >= y0 and dr[2] <= x1 and dr[3] <= y1:
+                rect_count += 1
 
-        return {
-            "rectangles": rect_count,
-            "text_blocks": text_block_count,
-            "total": rect_count + text_block_count,
-        }
+        return rect_count
+
+
 
     def _check_overlap(
         self,

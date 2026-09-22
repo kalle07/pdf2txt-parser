@@ -2,12 +2,12 @@
 
 import os
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Tuple
 
 import pymupdf
 
 from layout import BoundingBox
-from overlap import calculate_bbox_overlap, check_margin_violation
+from overlap import check_margin_violation
 
 
 @dataclass
@@ -30,6 +30,21 @@ class ImageInfo:
 class ImageExtractor:
     """Extract and save images from PDF pages."""
 
+    # Images that are at least this large in both dimensions are considered
+    # near-full-page images and are never saved.
+    NEAR_FULL_PAGE_RATIO = 0.90
+
+    # If text blocks completely covered by an image occupy at least this
+    # fraction of the image area, the image is skipped.
+    TEXT_COVERAGE_RATIO = 0.80
+
+
+    # Small tolerance for PDF floating-point/layout differences when deciding
+    # whether an image completely covers a text block. This prevents visually
+    # coincident image/text boxes from being treated as unrelated objects just
+    # because one edge differs by a point or two.
+    TEXT_CONTAINMENT_PERCENT_TOLERANCE = 0.05
+
     def __init__(self, config, pdf_filename: str, image_dir: str):
         """Initialize extractor with configuration and output directory."""
         self.config = config
@@ -40,7 +55,7 @@ class ImageExtractor:
         self,
         page: pymupdf.Page,
         page_num: int,
-        text_blocks_bboxes: List[Tuple[float, float, float, float]] = None,
+        text_blocks_bboxes: Optional[List[Tuple[float, float, float, float]]] = None,
     ) -> Tuple[List[ImageInfo], List[Tuple[float, float, float, float]]]:
         """Extract images from a page.
 
@@ -63,6 +78,22 @@ class ImageExtractor:
             img_bbox = img_info.get("bbox")
             img_width = img_info.get("width", 0)
             img_height = img_info.get("height", 0)
+
+            if not img_bbox or len(img_bbox) != 4:
+                image_list.append(
+                    ImageInfo(
+                        img_idx=img_idx + 1,
+                        xref=xref,
+                        page_num=page_num,
+                        saved=False,
+                        filename=None,
+                        filepath=None,
+                        skipped_reason="missing or invalid image bbox",
+                        width=img_width,
+                        height=img_height,
+                    )
+                )
+                continue
 
             # Process each image through validation, conflict resolution and optional saving.
             image_info = self._process_image(
@@ -99,18 +130,55 @@ class ImageExtractor:
     ) -> ImageInfo:
         """Validate and possibly save a single image.
 
-        All criteria are applied in the order defined by the original logic:
-            1. Minimum size check.
-            2. Full‑page image detection.
-            3. Margin violation detection.
-            4. Text‑block overlap detection.
-            5. Maximum‑items‑per‑page limit.
-            6. Final save decision based on configuration.
+        Rules applied:
+
+        1. Near-full-page images are never saved.
+           An image is considered near-full-page when its width is at least
+           ``NEAR_FULL_PAGE_RATIO`` of the page width and its height is at least
+           ``NEAR_FULL_PAGE_RATIO`` of the page height.
+
+        2. Very small images are skipped using ``config.min_size_px``.
+
+        3. Images violating margin rules are skipped.
+
+        4. For non-full-page images, if text blocks completely inside the image
+           collectively cover at least ``TEXT_COVERAGE_RATIO`` of the image width
+           and height, the image is skipped.
+
+        5. The per-page maximum item limit is applied.
+
+        6. Saving happens only when ``config.save_images`` is enabled.
         """
         bbox = BoundingBox.from_tuple(img_bbox)
-        min_dimension = min(img_width, img_height)
+        page_width = page.rect.width
+        page_height = page.rect.height
 
-        # 1️⃣ Minimum dimension threshold – skip tiny images.
+        # ------------------------------------------------------------------
+        # Rule 1: near-full-page images are never saved.
+        # Text extraction is independent and remains available in the output.
+        # ------------------------------------------------------------------
+        if self._is_near_full_page(bbox, page_width, page_height):
+            return ImageInfo(
+                img_idx=img_idx + 1,
+                xref=xref,
+                page_num=page_num,
+                saved=False,
+                filename=None,
+                filepath=None,
+                skipped_reason=(
+                    f"near-full-page image "
+                    f"({bbox.width:.0f}x{bbox.height:.0f}pts "
+                    f"vs page {page_width:.0f}x{page_height:.0f}pts)"
+                ),
+                width=img_width,
+                height=img_height,
+                bbox=bbox,
+            )
+
+        # ------------------------------------------------------------------
+        # Rule 2: skip tiny images.
+        # ------------------------------------------------------------------
+        min_dimension = min(img_width, img_height)
         if min_dimension < self.config.min_size_px:
             return ImageInfo(
                 img_idx=img_idx + 1,
@@ -120,31 +188,15 @@ class ImageExtractor:
                 filename=None,
                 filepath=None,
                 skipped_reason=f"below {self.config.min_size_px}px threshold",
+                width=img_width,
+                height=img_height,
+                bbox=bbox,
             )
 
-        page_width = page.rect.width
-        page_height = page.rect.height
-
-        # 2️⃣ Full‑page image detection – skip images that cover most of the page.
-        if page_width > 0 and page_height > 0:
-            img_width_pts = bbox.width
-            img_height_pts = bbox.height
-            if img_width_pts >= 0.8 * page_width and img_height_pts >= 0.8 * page_height:
-                return ImageInfo(
-                    img_idx=img_idx + 1,
-                    xref=xref,
-                    page_num=page_num,
-                    saved=False,
-                    filename=None,
-                    filepath=None,
-                    skipped_reason=(
-                        f"full-page image ({img_width_pts:.0f}x{img_height_pts:.0f}pts "
-                        f"vs page {page_width:.0f}x{page_height:.0f}pts)"
-                    ),
-                )
-
-        # 3️⃣ Margin violation check – images touching the outer margin are rejected.
-        if check_margin_violation(bbox, page.rect.width, page.rect.height, self.config):
+        # ------------------------------------------------------------------
+        # Rule 3: margin violation.
+        # ------------------------------------------------------------------
+        if check_margin_violation(bbox, page_width, page_height, self.config):
             return ImageInfo(
                 img_idx=img_idx + 1,
                 xref=xref,
@@ -153,10 +205,15 @@ class ImageExtractor:
                 filename=None,
                 filepath=None,
                 skipped_reason="Content lies on outer margin",
+                width=img_width,
+                height=img_height,
+                bbox=bbox,
             )
 
-        # 4️⃣ Overlap with nearby text blocks – reject if >90% overlap with similarly sized text.
-        if text_blocks_bboxes and self._check_text_overlap(bbox, text_blocks_bboxes):
+        # ------------------------------------------------------------------
+        # Rule 4: skip image if contained text blocks dominate the image area.
+        # ------------------------------------------------------------------
+        if self._covered_text_fills_image(bbox, text_blocks_bboxes):
             return ImageInfo(
                 img_idx=img_idx + 1,
                 xref=xref,
@@ -164,11 +221,21 @@ class ImageExtractor:
                 saved=False,
                 filename=None,
                 filepath=None,
-                skipped_reason="overlaps >90% with similar-size text block",
+                skipped_reason="image is mostly covered by contained text blocks",
+                width=img_width,
+                height=img_height,
+                bbox=bbox,
             )
 
-        # 5️⃣ Max‑items‑per‑page limit – stop processing once the limit is reached.
-        if self.config.max_items_per_page > 0 and page_image_count >= self.config.max_items_per_page:
+
+
+        # ------------------------------------------------------------------
+        # Rule 5: max items per page.
+        # ------------------------------------------------------------------
+        if (
+            self.config.max_items_per_page > 0
+            and page_image_count >= self.config.max_items_per_page
+        ):
             return ImageInfo(
                 img_idx=img_idx + 1,
                 xref=xref,
@@ -177,9 +244,14 @@ class ImageExtractor:
                 filename=None,
                 filepath=None,
                 skipped_reason="max limit reached",
+                width=img_width,
+                height=img_height,
+                bbox=bbox,
             )
 
-        # 6️⃣ Final save decision – only performed when ``save_images`` is True.
+        # ------------------------------------------------------------------
+        # Rule 6: final save decision.
+        # ------------------------------------------------------------------
         if self.config.save_images:
             return ImageInfo(
                 img_idx=img_idx + 1,
@@ -195,7 +267,6 @@ class ImageExtractor:
                 bbox=bbox,
             )
 
-        # If we reach here, the image is not saved for any of the above reasons.
         return ImageInfo(
             img_idx=img_idx + 1,
             xref=xref,
@@ -204,60 +275,171 @@ class ImageExtractor:
             filename=None,
             filepath=None,
             skipped_reason="save_images=False",
+            width=img_width,
+            height=img_height,
             bbox=bbox,
         )
 
-    def save_all(self, images: List[ImageInfo], doc: pymupdf.Document):
+    def save_all(self, images: List[ImageInfo], doc: pymupdf.Document) -> None:
         """Write all successfully validated images to disk."""
         if any(img.saved for img in images):
             os.makedirs(self.image_dir, exist_ok=True)
+
         for img in images:
-            if img.saved:
+            if img.saved and img.filename is not None:
                 img.filepath = os.path.join(self.image_dir, img.filename)
                 self._save_image_to_disk(img, doc)
 
-    def _save_image_to_disk(self, img: ImageInfo, doc: pymupdf.Document):
+    def _save_image_to_disk(self, img: ImageInfo, doc: pymupdf.Document) -> None:
         """Perform the actual file I/O for a saved image."""
         try:
-            # Load the image as a pixmap using its xref index.
             pix = pymupdf.Pixmap(doc, img.xref)
             png_data = pix.tobytes("png")
-            # Write the binary PNG data to the target file.
+
+            if img.filepath is None:
+                return
+
             with open(img.filepath, "wb") as f:
                 f.write(png_data)
+
             print(f"Saved image: {img.filename} ({img.width}x{img.height}px)")
         except Exception as exc:
-            # If saving fails, mark the image as not saved and record the error.
             img.saved = False
             img.skipped_reason = f"Save failed: {str(exc)}"
 
-    def _check_text_overlap(
+    def _is_near_full_page(
         self,
-        cluster_bbox: Union[Tuple[float, float, float, float], BoundingBox],
-        reference_bboxes: List[Tuple[float, float, float, float]],
+        bbox: BoundingBox,
+        page_width: float,
+        page_height: float,
     ) -> bool:
-        """Determine whether an image overlaps significantly with text blocks.
+        """Return True when the image occupies at least 90% of both page dimensions."""
+        if page_width <= 0 or page_height <= 0:
+            return False
 
-        An overlap is considered significant when:
-            - The IoU (intersection‑over‑union) exceeds 0.9.
-            - The areas of the two rectangles differ by less than 20 %.
-        """
-        bbox = (
-            cluster_bbox
-            if isinstance(cluster_bbox, BoundingBox)
-            else BoundingBox.from_tuple(cluster_bbox)
+        width_ratio = bbox.width / page_width
+        height_ratio = bbox.height / page_height
+
+        return (
+            width_ratio >= self.NEAR_FULL_PAGE_RATIO
+            and height_ratio >= self.NEAR_FULL_PAGE_RATIO
         )
-        for ref_bbox in reference_bboxes:
-            ref_box = BoundingBox.from_tuple(ref_bbox)
-            overlap_pct, _, has_overlap = calculate_bbox_overlap(bbox, ref_box)
-            if has_overlap and overlap_pct >= 0.9:
-                max_area = max(ref_box.area, bbox.area)
-                size_diff = (
-                    abs(ref_box.area - bbox.area) / max_area
-                    if max_area > 0
-                    else 1
-                )
-                if size_diff <= 0.2:
-                    return True
-        return False
 
+
+    def _covered_text_fills_image(
+        self,
+        image_bbox: BoundingBox,
+        text_blocks_bboxes: Optional[List[Tuple[float, float, float, float]]],
+    ) -> bool:
+        """
+        Return True when contained text blocks cover at least TEXT_COVERAGE_RATIO 
+        of the image area.
+        
+        Text blocks are considered "contained" if they lie within the image bounds, 
+        allowing for a percentage-based tolerance to handle slight layout shifts 
+        or blocks that are slightly larger than the image (e.g., up to 105%).
+        """
+        if not text_blocks_bboxes:
+            return False
+
+        image_width = image_bbox.width
+        image_height = image_bbox.height
+        if image_width <= 0 or image_height <= 0:
+            return False
+
+        # Calculate absolute tolerance based on image dimensions and percentage
+        x_tolerance = self.TEXT_CONTAINMENT_PERCENT_TOLERANCE * image_width
+        y_tolerance = self.TEXT_CONTAINMENT_PERCENT_TOLERANCE * image_height
+        
+        covered_rects: List[Tuple[float, float, float, float]] = []
+
+        for text_bbox_tuple in text_blocks_bboxes:
+            if not text_bbox_tuple or len(text_bbox_tuple) != 4:
+                continue
+
+            text_bbox = BoundingBox.from_tuple(text_bbox_tuple)
+            
+            # Skip degenerate boxes
+            if text_bbox.width <= 0 or text_bbox.height <= 0:
+                continue
+
+            # Check spatial containment with percentage-based tolerance.
+            # This allows text blocks to be slightly larger than the image 
+            # (up to TEXT_CONTAINMENT_PERCENT_TOLERANCE on each side) and still be counted.
+            is_contained = (
+                text_bbox.x0 >= image_bbox.x0 - x_tolerance
+                and text_bbox.y0 >= image_bbox.y0 - y_tolerance
+                and text_bbox.x1 <= image_bbox.x1 + x_tolerance
+                and text_bbox.y1 <= image_bbox.y1 + y_tolerance
+            )
+            
+            if not is_contained:
+                continue
+
+            # Clip the text block to the image bounds for accurate area calculation.
+            # This ensures we only count the overlap, not the part sticking out.
+            clipped_x0 = max(image_bbox.x0, text_bbox.x0)
+            clipped_y0 = max(image_bbox.y0, text_bbox.y0)
+            clipped_x1 = min(image_bbox.x1, text_bbox.x1)
+            clipped_y1 = min(image_bbox.y1, text_bbox.y1)
+
+            # Only add if there is actual overlap
+            if clipped_x1 > clipped_x0 and clipped_y1 > clipped_y0:
+                covered_rects.append((clipped_x0, clipped_y0, clipped_x1, clipped_y1))
+
+        if not covered_rects:
+            return False
+
+        # Calculate the union area of all contained text blocks to handle overlaps correctly
+        covered_area = self._rectangle_union_area(covered_rects)
+        image_area = image_width * image_height
+        
+        if image_area <= 0:
+            return False
+
+        coverage_ratio = covered_area / image_area
+
+        return coverage_ratio >= self.TEXT_COVERAGE_RATIO
+
+
+    @staticmethod
+    def _rectangle_union_area(
+        rectangles: List[Tuple[float, float, float, float]],
+    ) -> float:
+        """Return the union area of axis-aligned rectangles."""
+        if not rectangles:
+            return 0.0
+
+        x_edges = sorted(
+            {x for x0, _, x1, _ in rectangles for x in (x0, x1)}
+        )
+        union_area = 0.0
+
+        for x0, x1 in zip(x_edges, x_edges[1:]):
+            strip_width = x1 - x0
+            if strip_width <= 0:
+                continue
+
+            y_intervals = [
+                (y0, y1)
+                for rx0, y0, rx1, y1 in rectangles
+                if rx0 < x1 and rx1 > x0 and y1 > y0
+            ]
+            if not y_intervals:
+                continue
+
+            y_intervals.sort()
+            covered_y = 0.0
+            current_y0, current_y1 = y_intervals[0]
+
+            for y0, y1 in y_intervals[1:]:
+                if y0 <= current_y1:
+                    current_y1 = max(current_y1, y1)
+                else:
+                    covered_y += current_y1 - current_y0
+                    current_y0, current_y1 = y0, y1
+
+            covered_y += current_y1 - current_y0
+            union_area += strip_width * covered_y
+
+        return union_area

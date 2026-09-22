@@ -6,12 +6,15 @@
 import json                # JSON encoder/decoder – used for table JSON output
 import os                  # OS‑level utilities (path handling, file I/O)
 import time                # Time‑stamping / elapsed‑time calculations
+import logging
+import traceback 
 from concurrent.futures import ProcessPoolExecutor, as_completed
 #   –‑ ProcessPoolExecutor runs the worker pool; as_completed yields futures
 from dataclasses import dataclass   # Makes ConversionConfig & ConversionStats dataclasses
 from enum import Enum               # Defines ConversionMode enum
 from pathlib import Path            # Path objects for filesystem paths
 from typing import (Any, Callable, Dict, List, Optional, Tuple)  # Generic type hints
+
 
 # ------------------------------------------------------------
 # Third‑party imports (the only external dependencies)
@@ -26,6 +29,7 @@ import pymupdf                # PyMuPDF – PDF parsing, page access, drawing/im
 # ------------------------------------------------------------
 from drawings import DrawingExtractor, DrawingInfo
 from images import ImageExtractor, ImageInfo
+from formula import FormulaExtractor, FormulaInfo
 from layout import BoundingBox, passes_size_filter
 from overlap import (
     calculate_bbox_overlap,
@@ -59,13 +63,13 @@ class ConversionConfig:
     min_size_px: int = 100
     max_items_per_page: int = 10
 
-    row_tolerance: float = 15.0
-    col_tolerance: float = 50.0
+    row_tolerance: float = 0.0195   # fraction of page height (1.95 %)
+    col_tolerance: float = 0.016    # fraction of page width  (1.6 %)
     cluster_merge_tolerance: float = 20.0
     bbox_padding: float = 20.0
-    min_block_size_px: int = 10
+    min_block_size_px: int = 5
 
-    min_items_per_cluster: int = 10
+    min_items_per_cluster: int = 8
     include_small_text_blocks: bool = True
 
     enable_margin_check: bool = True
@@ -74,9 +78,15 @@ class ConversionConfig:
     margin_top: float = 0.06
     margin_bottom: float = 0.94
 
-    small_text_max_chars: int = 80
+    small_text_max_chars: int = 50
     hyphen_fix_enabled: bool = True
     include_metadata: bool = True
+    save_formulas: bool = True
+    formula_font_name: str = "Cambria Math"
+    formula_font_threshold: float = 0.50
+    formula_render_scale: float = 2.0
+    formula_padding: float = 5.0
+    formula_cluster_merge_tolerance: float = 5.0
 
 
 @dataclass
@@ -104,6 +114,7 @@ class ConversionStats:
     table_hyphens_fixed: int = 0
     word_count: int = 0
     char_count: int = 0
+    formulas_saved: int = 0
 
     def to_dict(self) -> Dict[str, int]:
         """Return only the counters that are greater than zero."""
@@ -146,6 +157,7 @@ def _process_pages_worker(
 
     It loads the PDF once, processes all pages in the chunk, then closes it.
     Returns a list of (page_num, content, stats) tuples — one per page in the chunk.
+    Exceptions are handled per-page to ensure a single bad page doesn't kill the whole chunk.
     """
     config = ConversionConfig(**config_dict)
     results: List[Tuple[int, str, Dict[str, int]]] = []
@@ -153,21 +165,39 @@ def _process_pages_worker(
     try:
         doc = pymupdf.Document(pdf_path)
         for page_num in range(page_range[0], page_range[1] + 1):
-            page = doc[page_num - 1]                     # pages are 1‑indexed here
-            page_stats = ConversionStats()               # fresh stats per page
-            processor = PageProcessor(
-                config=config,
-                pdf_filename=pdf_filename,
-                media_dir=media_dir,
-                stats=page_stats,
-                doc=doc,
-            )
-            page_content = processor.process(page, page_num, total_pages)
-            results.append((page_num, page_content, page_stats.to_dict()))
+            page_stats = ConversionStats()
+            
+            try:
+                page = doc[page_num - 1]
+                processor = PageProcessor(
+                    config=config,
+                    pdf_filename=pdf_filename,
+                    media_dir=media_dir,
+                    stats=page_stats,
+                    doc=doc,
+                )
+                page_content = processor.process(page, page_num, total_pages)
+                results.append((page_num, page_content, page_stats.to_dict()))
+            except Exception as page_exc:
+                # Log the error for this specific page and continue to the next
+
+                logging.error(f"Error processing page {page_num} of {pdf_filename}: {page_exc}")
+                
+                # Add an error entry for this specific page
+                error_content = f"\n\nERROR ON PAGE {page_num}: {str(page_exc)}\n\n"
+                error_stats = {
+                    "pages_processed": 0,
+                    "pages_failed": 1,
+                    "error": str(page_exc),
+                }
+                results.append((page_num, error_content, error_stats))
+        
         doc.close()
         return results
     except Exception as exc:
-        # Return an error entry for the first page in the chunk
+        # This block only catches errors that happen before the loop starts
+        # (e.g., file open failure) or if the loop itself crashes unexpectedly.
+        # In that case, we return an error for the first page as a fallback.
         chunk_size = page_range[1] - page_range[0] + 1
         return [
             (
@@ -181,6 +211,7 @@ def _process_pages_worker(
                 },
             )
         ]
+
 
 
 def create_processing_tasks(
@@ -246,7 +277,7 @@ def assemble_results(
 
     1. Sorts results by page number to preserve document order.
     2. Extracts per‑page statistics and aggregates them into a global dict.
-    3. Writes a human‑readable header (PDF name, media folder) followed by the
+    3. Writes a human‑readable header (PDF name, media folder, config status) followed by the
        page contents.
     The aggregated stats are returned for later merging.
     """
@@ -261,6 +292,7 @@ def assemble_results(
         "tables_skipped": 0,
         "word_count": 0,
         "char_count": 0,
+        "formulas_saved": 0,
         "errors": 0,
     }
 
@@ -276,18 +308,35 @@ def assemble_results(
             total_stats["tables_skipped"] += page_stats.get("tables_skipped", 0)
             total_stats["word_count"] += page_stats.get("word_count", 0)
             total_stats["char_count"] += page_stats.get("char_count", 0)
+            total_stats["formulas_saved"] += page_stats.get("formulas_saved", 0)
 
     with open(output_file, "w", encoding="utf-8") as output:
         output.write(f"PDF: {pdf_filename}\n")
         output.write(f"Media Directory: {os.path.basename(media_dir)}\n")
+        
+        # --- Configuration Status ---
         if config is not None:
-            output.write(
-                f"Hyphen Fix: {'enabled' if config.hyphen_fix_enabled else 'disabled'}\n"
-            )
+            output.write(f"Hyphen Fix: {'enabled' if config.hyphen_fix_enabled else 'disabled'}\n")
+            output.write(f"Image Extraction: {'enabled' if config.save_images else 'disabled'}\n")
+            output.write(f"Drawing Extraction: {'enabled' if config.save_drawings else 'disabled'}\n")
+            output.write(f"Formula Extraction: {'enabled' if config.save_formulas else 'disabled'}\n")
+        # ---------------------------------------
+
         output.write(f"Word Count: {total_stats['word_count']}\n")
         output.write(f"Character Count: {total_stats['char_count']}\n")
-        output.write(f"Text Hyphens Fixed: {total_stats['hyphens_fixed']}\n")
-        output.write(f"Table Hyphens Fixed: {total_stats['table_hyphens_fixed']}\n")
+        
+        # --- Conditional counts: only shown when the feature is enabled ---
+        if config is None or config.save_formulas:
+            output.write(f"Formulas Saved: {total_stats['formulas_saved']}\n")
+        if config is None or config.save_images:
+            output.write(f"Images Saved: {total_stats['images_saved']}\n")
+        if config is None or config.save_drawings:
+            output.write(f"Drawings Saved: {total_stats['drawings_saved']}\n")            
+        if config is None or config.hyphen_fix_enabled:
+            output.write(f"Text Hyphens Fixed: {total_stats['hyphens_fixed']}\n")
+            output.write(f"Table Hyphens Fixed: {total_stats['table_hyphens_fixed']}\n")
+        # ------------------------------------------------------------------
+        
         output.write("=" * 60 + "\n\n")
 
         cleaned_metadata = _clean_pdf_metadata(metadata)
@@ -388,7 +437,13 @@ class PageProcessor:
         self.stats = stats
         self.doc = doc
 
-    def process(self, page: pymupdf.Page, page_num: int, total_pages: int) -> str:
+    def process(
+        self,
+        page: pymupdf.Page,
+        page_num: int,
+        total_pages: int,
+        formula_start_num: int = 1,
+    ) -> str:
         """Extract and format all content from a single page.
 
         The method orchestrates extraction of tables, text blocks, images,
@@ -402,7 +457,10 @@ class PageProcessor:
         reference_bboxes: Dict[str, List[Tuple[float, float, float, float]]] = {
             "tables": [],
             "text_blocks": [],
+            "formula_blocks": [],
             "images": [],
+            "attached_text_blocks": [],
+            "drawing_blocks": [],
         }
 
         # ------------------------------------------------------------------
@@ -411,12 +469,36 @@ class PageProcessor:
         page_content.extend(self._process_tables(page, page_num, reference_bboxes))
 
         # ------------------------------------------------------------------
-        # 2️⃣ Extract plain text blocks (excluding those inside tables)
+        # 2️⃣ Extract Cambria Math-heavy formula blocks before normal text
+        #    Formula blocks are treated as visual media and are therefore
+        #    excluded from normal text extraction.
         # ------------------------------------------------------------------
-        page_content.extend(self._process_text_blocks(page, page_num, reference_bboxes))
+        formula_extractor = None
+        formula_list: List[FormulaInfo] = []
+        if self.config.save_formulas:
+            formula_extractor = FormulaExtractor(
+                self.config,
+                self.pdf_filename,
+                self.media_dir,
+            )
+            formula_list = formula_extractor.extract_formulas(page, page_num)
+            
+            reference_bboxes["formula_blocks"] = [
+                formula.bbox for formula in formula_list
+                if formula.bbox is not None and isinstance(formula.bbox, (list, tuple)) and len(formula.bbox) == 4
+            ]
 
         # ------------------------------------------------------------------
-        # 3️⃣ Extract images (if enabled)
+        # 3️⃣ Collect plain text blocks (excluding tables and formula blocks).
+        #    Output is deliberately deferred until drawings are known, so any
+        #    plain block covered by a drawing can be removed before emission.
+        # ------------------------------------------------------------------
+        plain_text_blocks = self._process_text_blocks(
+            page, page_num, reference_bboxes
+        )
+
+        # ------------------------------------------------------------------
+        # 4️⃣ Extract images (if enabled)
         # ------------------------------------------------------------------
         image_extractor = None
         images_on_page: List[ImageInfo] = []
@@ -432,38 +514,85 @@ class PageProcessor:
             reference_bboxes["images"] = image_bboxes
 
         # ------------------------------------------------------------------
-        # 4️⃣ Extract drawings (if enabled)
+        # 5️⃣ Extract drawings
         # ------------------------------------------------------------------
-        drawing_extractor = None
-        drawing_list: List[DrawingInfo] = []
-        if self.config.save_drawings:
-            drawing_extractor = DrawingExtractor(
-                self.config, self.pdf_filename, self.media_dir
-            )
-            drawing_list, _, _ = drawing_extractor.extract_drawings(
-                page,
-                page_num,
-                reference_bboxes,
-                0,
-                self.stats,
-            )
+        drawing_extractor = DrawingExtractor(
+            self.config, self.pdf_filename, self.media_dir
+        )
+        drawing_list, _, _ = drawing_extractor.extract_drawings(
+            page,
+            page_num,
+            reference_bboxes,
+            0,
+            self.stats,
+        )
 
         # ------------------------------------------------------------------
-        # 5️⃣ Resolve conflicts between images and drawings that heavily overlap
+        # 6️⃣ Resolve conflicts between images and drawings that heavily overlap
         # ------------------------------------------------------------------
         self._resolve_image_drawing_conflicts(images_on_page, drawing_list)
 
         # ------------------------------------------------------------------
-        # 6️⃣ Save extracted media to disk
+        # 6b️⃣ When drawings are not saved, treat each saved drawing as ONE
+        #     independent text block.  Reserve its full drawing area first,
+        #     remove overlapping plain-text blocks, then emit drawing text
+        #     after all remaining plain text.
+        # ------------------------------------------------------------------
+        drawing_text_blocks: List[Tuple[Tuple[float, float, float, float], str, int]] = []
+        
+        # Only process drawings that are marked as saved (valid)
+        valid_drawing_bboxes = [
+            drawing_info.bbox.to_tuple()
+            for drawing_info in drawing_list
+            if drawing_info.saved and drawing_info.bbox is not None
+        ]
+
+        if valid_drawing_bboxes:
+            reference_bboxes["drawing_blocks"] = valid_drawing_bboxes
+
+            # Extract text from each valid drawing area
+            drawing_text_blocks = self._extract_drawing_text_blocks(
+                page, drawing_list
+            )
+
+            # Remove any plain text block that overlaps with a drawing area
+            plain_text_blocks = [
+                block
+                for block in plain_text_blocks
+                if not self._text_block_overlaps_drawing(
+                    block[0], valid_drawing_bboxes
+                )
+            ]
+
+        # ------------------------------------------------------------------
+        # 7️⃣ Emit text in the required order:
+        #     1) remaining plain text blocks
+        #     2) drawing-contained text blocks
+        # ------------------------------------------------------------------
+        for _, fixed_text, fix_count in plain_text_blocks:
+            self.stats.hyphens_fixed += fix_count
+            self._record_text_counts(fixed_text)
+            page_content.append(fixed_text + "\n\n")
+
+        for _, fixed_text, fix_count in drawing_text_blocks:
+            self.stats.hyphens_fixed += fix_count
+            self._record_text_counts(fixed_text)
+            # Optionally add a marker to indicate this text came from a drawing
+            page_content.append("\n\n[Text from Drawing]\n")
+            page_content.append(fixed_text + "\n\n")
+
+        # ------------------------------------------------------------------
+        # 8️⃣ Save extracted media to disk (only when enabled)
         # ------------------------------------------------------------------
         if image_extractor:
             image_extractor.save_all(images_on_page, self.doc)
-        if drawing_extractor:
+        if drawing_extractor and self.config.save_drawings:
             drawing_extractor.save_all(drawing_list, page)
 
         # ------------------------------------------------------------------
-        # 7️⃣ Append JSON metadata for images and drawings
+        # 8️⃣ Append JSON metadata for formulas, images and drawings
         # ------------------------------------------------------------------
+        page_content.extend(self._write_formula_info(formula_list, page_num))
         page_content.extend(self._write_image_info(images_on_page, page_num))
         page_content.extend(self._write_drawing_info(drawing_list, page_num))
 
@@ -544,12 +673,25 @@ class PageProcessor:
         if not tables_obj or not tables_obj.tables:
             return content
 
+        page_text_blocks = page.get_text("blocks")
+        
         table_num = 0
         for table in tables_obj.tables:
             table_num += 1
+
+            # Keep the parser output untouched. TableProcessor owns all
+            # reconstruction/cleanup logic; this dict is only the raw source.
             raw_data = table.extract()
-            cleaned_data, table_fix_count = TableProcessor.clean_table_data(
+            raw_table = TableProcessor.make_raw_table(
+                table,
                 raw_data,
+                page_num,
+                table_num,
+            )
+
+            # Build the final logical matrix from bbox geometry, then clean it.
+            cleaned_data, table_fix_count = TableProcessor.prepare_table_data(
+                raw_table,
                 hyphen_fix_enabled=self.config.hyphen_fix_enabled,
                 return_fix_count=True,
             )
@@ -580,8 +722,34 @@ class PageProcessor:
                 continue
 
             # ---- Process and serialize ----------------------------------------
-            table_data = TableProcessor.process_table(cleaned_data, page_num, table_num)
+            table_data = TableProcessor.process_table(
+                cleaned_data,
+                page_num,
+                table_num,
+            )
+
+            # Skip tables with no actual data rows (e.g., only headline/description)
+            if table_data.data_rows_count == 0:
+                self.stats.tables_skipped += 1
+                continue
+
             self.stats.table_hyphens_fixed += table_fix_count
+
+            # These blocks are removed from normal text output later.
+            attached_bboxes = set(reference_bboxes.get("attached_text_blocks", []))
+            
+            table_data = TableProcessor.attach_nearby_text_blocks(
+                table_data,
+                BoundingBox.from_tuple(table_bbox),
+                page_text_blocks,
+                attached_bboxes,
+                max_lines=2,
+                max_chars=250,
+                max_distance_px=10.0,
+                max_overlap_px=2.0,
+            )
+            reference_bboxes["attached_text_blocks"] = list(attached_bboxes)
+
             self._record_table_counts(table_data)
             reference_bboxes["tables"].append(table_bbox)
             content.extend(self._format_table_output(table_data, page_num, table_num))
@@ -616,17 +784,12 @@ class PageProcessor:
         content.append(f"Type: {table_data.type}\n")
         content.append(f"Has Header: {table_data.has_header_row}\n")
         content.append(f"Data Rows: {table_data.data_rows_count}\n")
-        if table_data.headline:
-            content.append(f"Headline: {table_data.headline}\n")
 
         table_json = {
             "table_number": table_num,
             "page_number": page_num,
-            "type": table_data.type,
             "headline": table_data.headline,
             "description": table_data.description,
-            "column_headers": table_data.column_headers,
-            "data_rows_count": table_data.data_rows_count,
             "data_rows": table_data.data_rows,
         }
         content.append("```json\n")
@@ -639,16 +802,16 @@ class PageProcessor:
         page: pymupdf.Page,
         page_num: int,
         reference_bboxes: Dict[str, List[Tuple[float, float, float, float]]],
-    ) -> List[str]:
-        """Extract plain text blocks while avoiding duplicates inside tables.
+    ) -> List[Tuple[Tuple[float, float, float, float], str, int]]:
+        """Collect normal text blocks without emitting them yet.
 
-        Blocks are first sorted by layout, then each block is examined for
-        containment or high overlap with any previously‑recorded table bbox.
-        Hyphen‑joined words are optionally fixed before being added to the output.
+        The returned records contain ``(bbox, normalized_text, hyphen_fix_count)``.
+        Emission is deferred until drawings have been resolved so drawing-area
+        overlap can suppress duplicate plain-text output.
         """
-        content = []
+        content: List[Tuple[Tuple[float, float, float, float], str, int]] = []
         blocks = page.get_text("blocks")
-        sorted_blocks = self._sort_blocks_by_layout(blocks)
+        sorted_blocks = self._sort_blocks_by_layout(blocks, page)
 
         for block in sorted_blocks:
             if not block or len(block) < 5:
@@ -656,76 +819,161 @@ class PageProcessor:
 
             x0, y0, x1, y1, text = block[:5]
             block_bbox = BoundingBox.from_tuple((x0, y0, x1, y1))
+            block_bbox_tuple = (x0, y0, x1, y1)
+
+            # Skip text blocks already attached to a table as headline/description.
+            attached_bboxes = set(reference_bboxes.get("attached_text_blocks", []))
+            if block_bbox_tuple in attached_bboxes:
+                continue
 
             # ---- Margin filter ------------------------------------------------
-            if self._text_block_violates_margin(block_bbox, page):
+            if check_margin_violation(
+                block_bbox, page.rect.width, page.rect.height, self.config
+            ):
                 continue
             if not text.strip():
                 continue
 
             # TABLE PRIORITY CHECKS (Tables take precedence over text blocks)
             should_skip = False
-            
-            for tx0, ty0, tx1, ty1 in reference_bboxes['tables']:
+
+            for tx0, ty0, tx1, ty1 in reference_bboxes["tables"]:
                 table_bbox = BoundingBox.from_tuple((tx0, ty0, tx1, ty1))
-                
+
                 # CHECK 1: Text block completely contained within table area
-                if (block_bbox.x0 >= table_bbox.x0 and 
-                    block_bbox.y0 >= table_bbox.y0 and 
-                    block_bbox.x1 <= table_bbox.x1 and 
-                    block_bbox.y1 <= table_bbox.y1):
+                if (
+                    block_bbox.x0 >= table_bbox.x0
+                    and block_bbox.y0 >= table_bbox.y0
+                    and block_bbox.x1 <= table_bbox.x1
+                    and block_bbox.y1 <= table_bbox.y1
+                ):
                     should_skip = True
                     break
-                
-                # CHECK 2: High overlap with similar size (existing logic, enhanced)
-                overlap_pct, _, has_overlap = calculate_bbox_overlap(block_bbox, table_bbox)
-                
+
+                # CHECK 2: High overlap with similar size
+                overlap_pct, _, has_overlap = calculate_bbox_overlap(
+                    block_bbox, table_bbox
+                )
+
                 if has_overlap and overlap_pct > 0.9:
                     if max(table_bbox.area, block_bbox.area) > 0:
-                        size_diff = abs(block_bbox.area - table_bbox.area) / max(table_bbox.area, block_bbox.area)
+                        size_diff = abs(
+                            block_bbox.area - table_bbox.area
+                        ) / max(table_bbox.area, block_bbox.area)
                         if size_diff <= 0.2:
-                            should_skip = True                    
-            
+                            should_skip = True
+                            break
+
+            if should_skip:
+                continue
+
+            # FORMULA PRIORITY CHECK
+            # Cambria Math-heavy blocks have already been rendered as images.
+            # Skip the corresponding text block so the formula is not emitted twice.
+            for formula_bbox_tuple in reference_bboxes.get("formula_blocks", []):
+                if (
+                    not isinstance(formula_bbox_tuple, (list, tuple))
+                    or len(formula_bbox_tuple) != 4
+                ):
+                    continue
+
+                fx0, fy0, fx1, fy1 = formula_bbox_tuple
+                formula_bbox = BoundingBox.from_tuple((fx0, fy0, fx1, fy1))
+
+                contained = (
+                    block_bbox.x0 >= formula_bbox.x0
+                    and block_bbox.y0 >= formula_bbox.y0
+                    and block_bbox.x1 <= formula_bbox.x1
+                    and block_bbox.y1 <= formula_bbox.y1
+                )
+                overlap_pct, _, has_overlap = calculate_bbox_overlap(
+                    block_bbox, formula_bbox
+                )
+
+                if contained or (has_overlap and overlap_pct > 0.9):
+                    should_skip = True
+                    break
+
             if should_skip:
                 continue
 
             text = text.replace("\u00ad", "")  # SOFT HYPHEN
-            text = text.replace("\u200b", "") # Remove zero-width space
-            text = text.replace("\u2009", " ") # Normalize thin space to regular space
-            text = text.replace("\u00a0", " ") # NBSP Non-breaking space
-            text = text.replace("\u2002", " ") # ENSP En space
-            text = text.replace("\u200a", " ") # HAIR SPACE            
+            text = text.replace("\u200b", "")  # Remove zero-width space
+            text = text.replace("\u2009", " ")  # Normalize thin space to space
+            text = text.replace("\u00a0", " ")  # NBSP
+            text = text.replace("\u2002", " ")  # EN SPACE
+            text = text.replace("\u200a", " ")  # HAIR SPACE
 
-        
-            # ---- Hyphen‑fix (optional) -----------------------------------------
             if self.config.hyphen_fix_enabled:
                 fixed_text, fix_count = fix_hyphenated_lines(text)
-                self.stats.hyphens_fixed += fix_count
             else:
-                fixed_text = text
+                fixed_text, fix_count = text, 0
 
-            self._record_text_counts(fixed_text)
-            content.append(fixed_text + "\n\n")
-            reference_bboxes["text_blocks"].append((x0, y0, x1, y1))
+            fixed_text = fixed_text.strip()
+            if not fixed_text:
+                continue
+
+            reference_bboxes["text_blocks"].append(block_bbox_tuple)
+            content.append((block_bbox_tuple, fixed_text, fix_count))
 
         return content
 
-    def _text_block_violates_margin(self, bbox: BoundingBox, page: pymupdf.Page) -> bool:
-        """Use strict margin filtering for text so side notes/headers do not leak into chunks."""
-        if not getattr(self.config, "enable_margin_check", False):
-            return False
+    def _extract_drawing_text_blocks(
+        self,
+        page: pymupdf.Page,
+        drawing_list: List[DrawingInfo],
+    ) -> List[Tuple[Tuple[float, float, float, float], str, int]]:
+        """Extract each saved drawing's text as one independent text block.
 
-        safe_x0 = self.config.margin_left * page.rect.width
-        safe_x1 = self.config.margin_right * page.rect.width
-        safe_y0 = self.config.margin_top * page.rect.height
-        safe_y1 = self.config.margin_bottom * page.rect.height
-        return not (
-            bbox.x0 >= safe_x0
-            and bbox.x1 <= safe_x1
-            and bbox.y0 >= safe_y0
-            and bbox.y1 <= safe_y1
-        )
+        Text is clipped to the complete drawing bbox, normalized using the same
+        rules as normal text, and returned in drawing layout order.  Nothing is
+        emitted here; the caller emits these blocks after all plain text.
+        """
+        content: List[Tuple[Tuple[float, float, float, float], str, int]] = []
 
+        for drawing_info in drawing_list:
+            if not drawing_info.saved or drawing_info.bbox is None:
+                continue
+
+            drawing_bbox = drawing_info.bbox.to_tuple()
+            clip = pymupdf.Rect(drawing_bbox)
+            raw_text = page.get_text("text", clip=clip)
+
+            raw_text = raw_text.replace("\u00ad", "")
+            raw_text = raw_text.replace("\u200b", "")
+            raw_text = raw_text.replace("\u2009", " ")
+            raw_text = raw_text.replace("\u00a0", " ")
+            raw_text = raw_text.replace("\u2002", " ")
+            raw_text = raw_text.replace("\u200a", " ")
+
+            if self.config.hyphen_fix_enabled:
+                fixed_text, fix_count = fix_hyphenated_lines(raw_text)
+            else:
+                fixed_text, fix_count = raw_text, 0
+
+            fixed_text = fixed_text.strip()
+            if fixed_text:
+                content.append((drawing_bbox, fixed_text, fix_count))
+
+        # Drawings are emitted as whole blocks, ordered by page position.
+        content.sort(key=lambda item: (item[0][1], item[0][0]))
+        return content
+
+    @staticmethod
+    def _text_block_overlaps_drawing(
+        block_bbox_tuple: Tuple[float, float, float, float],
+        drawing_bboxes: List[Tuple[float, float, float, float]],
+    ) -> bool:
+        """Return True when any part of a plain text block overlaps a drawing area."""
+        block_bbox = BoundingBox.from_tuple(block_bbox_tuple)
+
+        for drawing_bbox_tuple in drawing_bboxes:
+            drawing_bbox = BoundingBox.from_tuple(drawing_bbox_tuple)
+            _, _, has_overlap = calculate_bbox_overlap(block_bbox, drawing_bbox)
+            if has_overlap:
+                return True
+
+        return False
     def _record_text_counts(self, text: str) -> None:
         """Record word and character counts for extracted text."""
         self.stats.word_count += count_words(text)
@@ -764,15 +1012,22 @@ class PageProcessor:
     # ----------------------------------------------------------------------
     # Layout‑sorting utilities
     # ----------------------------------------------------------------------
-    def _sort_blocks_by_layout(self, blocks: List[Tuple]) -> List[Tuple]:
-        """Sort text blocks into reading order while respecting column structure.
+    def _sort_blocks_by_layout(
+        self,
+        blocks: List[Tuple],
+        page: Optional[pymupdf.Page] = None,
+    ) -> List[Tuple]:
+        """Sort text blocks into reading order while respecting column and row structure.
 
         The algorithm:
 
         1. Discard blocks smaller than ``min_block_size_px``.
         2. If only one block remains, return it.
-        3. Otherwise, detect column boundaries using ``col_tolerance``.
-        4. Sort blocks column‑wise, then append any non‑column blocks.
+        3. Otherwise, detect column boundaries using ``col_tolerance`` (as a
+           fraction of page width).
+        4. Within each column, group blocks into rows using ``row_tolerance``
+           (as a fraction of page height) and sort left‑to‑right inside each row.
+        5. Append any non‑column blocks in Y order.
         """
         if not blocks or len(blocks) < 2:
             return [
@@ -792,16 +1047,31 @@ class PageProcessor:
 
         # ---- Column detection -----------------------------------------------
         blocks_by_x = sorted(filtered_blocks, key=lambda b: b[0])
-        columns = self._detect_columns(blocks_by_x)
+        columns = self._detect_columns(blocks_by_x, page.rect.width if page is not None else 0.0)
 
         # ---- Re‑assemble final order -----------------------------------------
-        sorted_columns = []
+        page_height = page.rect.height if page is not None else 0.0
+        row_threshold = self.config.row_tolerance * page_height
+
+        sorted_columns: List[List[Tuple]] = []
         all_column_block_indices = set()
         for column in columns:
-            sorted_col = sorted(column, key=lambda b: b[1])
-            for block in sorted_col:
-                all_column_block_indices.add(id(block))
-            sorted_columns.append(sorted_col)
+            # Sort by top edge, then group into rows using row_tolerance.
+            column_by_y = sorted(column, key=lambda b: b[1])
+            rows: List[List[Tuple]] = []
+            current_row: List[Tuple] = [column_by_y[0]]
+            for block in column_by_y[1:]:
+                if row_threshold > 0 and abs(block[1] - current_row[-1][1]) <= row_threshold:
+                    current_row.append(block)
+                else:
+                    rows.append(sorted(current_row, key=lambda b: b[0]))
+                    current_row = [block]
+            rows.append(sorted(current_row, key=lambda b: b[0]))
+
+            for row in rows:
+                for block in row:
+                    all_column_block_indices.add(id(block))
+            sorted_columns.extend(rows)
 
         # Blocks that do not belong to any detected column keep their original Y order
         non_column_blocks = [b for b in filtered_blocks if id(b) not in all_column_block_indices]
@@ -809,50 +1079,127 @@ class PageProcessor:
 
         sorted_blocks = []
         sorted_blocks.extend(non_column_blocks)
-        for column in sorted_columns:
-            sorted_blocks.extend(column)
+        for row in sorted_columns:
+            sorted_blocks.extend(row)
         return sorted_blocks
+    
 
-    def _detect_columns(self, blocks_by_x: List[Tuple]) -> List[List[Tuple]]:
+# In converter.py
+
+    def _detect_columns(
+        self,
+        blocks_by_x: List[Tuple],
+        page_width: float,
+    ) -> List[List[Tuple]]:
         """Group blocks that belong to the same vertical column.
 
-        Two blocks are considered part of the same column when their left‑edge
-        x‑coordinates differ by at most ``col_tolerance``.  The function returns
-        a list of columns, each column being a list of blocks sorted by top Y.
+        Two blocks are considered part of the same column if:
+        1. Their center X coordinates differ by at most ``col_tolerance * page_width``, OR
+        2. Their horizontal bounding boxes overlap by more than 50% of their smaller width.
+
+        This is more robust than comparing only left edges, as it handles indented
+        text, centered paragraphs, and justified text better.
         """
         if not blocks_by_x:
             return []
 
-        columns = []
-        used_block_ids = set()
+        # Pre-compute center X for each block to avoid repeated calculation
+        # blocks_by_x items are tuples: (x0, y0, x1, y1, text, ...)
+        block_centers = [(block[0] + block[2]) / 2.0 for block in blocks_by_x]
+        
+        columns: List[List[Tuple]] = []
+        used_block_indices: set[int] = set()
 
-        for i, block in enumerate(blocks_by_x):
-            block_id = id(block)
-            if block_id in used_block_ids:
+        # Sort by center X to make column detection more stable
+        sorted_indices = sorted(range(len(blocks_by_x)), key=lambda i: block_centers[i])
+
+        for i_idx, i in enumerate(sorted_indices):
+            if i in used_block_indices:
                 continue
 
-            x0, _, _, _ = block[:4]
-            current_col = [block]
-            used_block_ids.add(block_id)
-
-            for j in range(i + 1, len(blocks_by_x)):
-                other_block = blocks_by_x[j]
-                other_id = id(other_block)
-                if other_id in used_block_ids:
+            current_col = [blocks_by_x[i]]
+            used_block_indices.add(i)
+            center_i = block_centers[i]
+            
+            # Check against all other blocks to find those in the same column
+            for j_idx, j in enumerate(sorted_indices):
+                if j == i or j in used_block_indices:
                     continue
+                
+                center_j = block_centers[j]
+                
+                # Criterion 1: Center X alignment within tolerance
+                col_threshold = self.config.col_tolerance * page_width
+                centers_close = abs(center_i - center_j) <= col_threshold
+                
+                # Criterion 2: Significant horizontal overlap (fallback for indented/justified text)
+                # Calculate horizontal overlap percentage relative to the smaller width
+                i_x0, _, i_x1, _ = blocks_by_x[i][:4]
+                j_x0, _, j_x1, _ = blocks_by_x[j][:4]
+                
+                min_width = max(1e-6, min(i_x1 - i_x0, j_x1 - j_x0)) # Avoid division by zero
+                overlap_start = max(i_x0, j_x0)
+                overlap_end = min(i_x1, j_x1)
+                overlap_width = max(0.0, overlap_end - overlap_start)
+                
+                overlap_ratio = overlap_width / min_width
+                overlaps_significantly = overlap_ratio > 0.7
 
-                ox0 = other_block[0]
-                if abs(ox0 - x0) <= self.config.col_tolerance:
-                    current_col.append(other_block)
-                    used_block_ids.add(other_id)
+                if centers_close or overlaps_significantly:
+                    current_col.append(blocks_by_x[j])
+                    used_block_indices.add(j)
 
             columns.append(current_col)
 
         return columns
 
+
     # ----------------------------------------------------------------------
     # Media metadata generation
     # ----------------------------------------------------------------------
+    def _write_formula_info(
+        self,
+        formula_list: List[FormulaInfo],
+        page_num: int,
+    ) -> List[str]:
+        """Create a JSON block describing Cambria Math formula images."""
+        content: List[str] = []
+
+        if formula_list:
+            saved_count = sum(1 for formula in formula_list if formula.saved)
+            self.stats.formulas_saved += saved_count
+
+            formula_data = {
+                "formula_count": len(formula_list),
+                "formulas_saved": saved_count,
+                "font_name": self.config.formula_font_name,
+                #"font_threshold": self.config.formula_font_threshold,
+                "media_folder": f"{self.pdf_filename}_media",
+                "formulas_on_page": [
+                    {
+                        "number": formula.formula_num,
+                        "page_number": formula.page_num,
+                        #"bbox": formula.bbox, # optional
+                        #"char_count": formula.char_count, # optional
+                        #"cambria_math_char_count": formula.cambria_math_char_count, # optional
+                        #"cambria_math_ratio": formula.cambria_math_ratio, # optional
+                        "saved": formula.saved,
+                        "filename": formula.filename if formula.saved else None,
+                        "skipped_reason": formula.skipped_reason,
+                    }
+                    for formula in formula_list
+                ],
+            }
+
+            content.append(
+                f"\n\nFORMULAS FOUND ON PAGE {page_num}: {len(formula_list)}\n\n"
+            )
+            content.append("```json\n")
+            content.append(json.dumps(formula_data, indent=2, ensure_ascii=False))
+            content.append("\n```\n\n")
+
+        return content
+
     def _write_image_info(self, images_on_page: List[ImageInfo], page_num: int) -> List[str]:
         """Create a JSON block that lists all images found on the page.
 
@@ -890,46 +1237,55 @@ class PageProcessor:
             content.append("```json\n")
             content.append(json.dumps(image_data, indent=2, ensure_ascii=False))
             content.append("\n```\n\n")
-        else:
-            if not self.config.save_images:
-                content.append(f"Image extraction disabled on page {page_num}.\n\n")
-            else:
-                content.append(f"No images detected on page {page_num}.\n\n")
+
         return content
 
     def _write_drawing_info(self, drawing_list: List[DrawingInfo], page_num: int) -> List[str]:
-        """Create a JSON block that lists all drawings found on the page."""
+        """Create drawing JSON only when drawing-image saving is enabled."""
         content = []
-        if drawing_list:
-            drawings_saved = sum(1 for drawing in drawing_list if drawing.saved)
-            self.stats.drawings_saved += drawings_saved
 
-            drawing_data = {
-                "drawing_count": len(drawing_list),
-                "drawings_saved": drawings_saved,
-                "drawings_failed": len(drawing_list) - drawings_saved,
-                "minimum_size_threshold_px": self.config.min_size_px,
-                "media_folder": f"{self.pdf_filename}_media",
-                "drawings_with_resolution": [
-                    {
-                        "index": drawing.index,
-                        "resolution": drawing.resolution,
-                        "saved": drawing.saved,
-                        "filename": drawing.filename,
-                        "skipped_reason": drawing.skipped_reason
-                        or (drawing.save_error and "save failed")
-                        or None,
-                    }
-                    for drawing in drawing_list
-                ],
-            }
+        # Drawings are always detected internally, but drawing JSON is an output
+        # feature controlled strictly by the save_drawings flag. When disabled,
+        # no drawing JSON is emitted even if drawings were detected.
+        if not self.config.save_drawings:
+            return content
 
-            content.append(f"\n\nDRAWINGS FOUND ON PAGE {page_num}: {len(drawing_list)}\n\n")
-            content.append("```json\n")
-            content.append(json.dumps(drawing_data, indent=2, ensure_ascii=False))
-            content.append("\n```\n\n")
-        else:
-            content.append(f"No drawings detected on page {page_num}.\n\n")
+        # A drawing may be detected but later fail to save (or be removed by
+        # image/drawing conflict resolution). Only successfully saved images
+        # should produce drawing JSON metadata.
+        saved_drawings = [
+            drawing
+            for drawing in drawing_list
+            if drawing.saved and drawing.filename
+        ]
+
+        if not saved_drawings:
+            return content
+
+        drawings_saved = len(saved_drawings)
+        self.stats.drawings_saved += drawings_saved
+
+        drawing_data = {
+            "drawing_count": drawings_saved,
+            "drawings_saved": drawings_saved,
+            "minimum_size_threshold_px": self.config.min_size_px,
+            "media_folder": f"{self.pdf_filename}_media",
+            "drawings_with_resolution": [
+                {
+                    "index": drawing.index,
+                    "resolution": drawing.resolution,
+                    "saved": True,
+                    "filename": drawing.filename,
+                    "skipped_reason": None,
+                }
+                for drawing in saved_drawings
+            ],
+        }
+
+        content.append(f"\n\nDRAWINGS SAVED ON PAGE {page_num}: {drawings_saved}\n\n")
+        content.append("```json\n")
+        content.append(json.dumps(drawing_data, indent=2, ensure_ascii=False))
+        content.append("\n```\n\n")
 
         return content
 
@@ -993,6 +1349,7 @@ class PDFConverter:
         self._clear_media_folders(valid_files, output_in_source_dir, output_dir)
 
         tasks = create_processing_tasks(valid_files, cores)
+        
         global_stats = self._create_global_stats()
         results_by_file = self._run_tasks(tasks, output_dir, cores, global_stats)
 
@@ -1052,6 +1409,7 @@ class PDFConverter:
             )
         return valid_files
 
+
     def _create_global_stats(self) -> Dict[str, int]:
         """Initialize a dict that will collect aggregates across all files."""
         return {
@@ -1063,6 +1421,7 @@ class PDFConverter:
             "table_hyphens_fixed": 0,
             "word_count": 0,
             "char_count": 0,
+            "formulas_saved": 0,
             "errors": 0,
         }
 
@@ -1101,12 +1460,8 @@ class PDFConverter:
 
                 future = executor.submit(
                     _process_pages_worker,
-                    pdf_path,
-                    page_range,
-                    total_pages_this,
-                    config_dict,
-                    media_dir,
-                    pdf_filename,
+                    pdf_path, page_range, total_pages_this,
+                    config_dict, media_dir, pdf_filename,
                 )
                 future_to_task[future] = {
                     "pdf_filename": pdf_filename,
@@ -1119,6 +1474,7 @@ class PDFConverter:
             pages_done_by_file: Dict[str, int] = {}
             imgs_by_file: Dict[str, int] = {}
             dws_by_file: Dict[str, int] = {}
+            formulas_by_file: Dict[str, int] = {}
             cancelled = False
             for future in as_completed(future_to_task):
                 # honour a cancellation request: cancel every not-yet-started
@@ -1149,6 +1505,7 @@ class PDFConverter:
                         )
                         imgs_by_file[filename] = imgs_by_file.get(filename, 0) + stats.get("images_saved", 0)
                         dws_by_file[filename] = dws_by_file.get(filename, 0) + stats.get("drawings_saved", 0)
+                        formulas_by_file[filename] = formulas_by_file.get(filename, 0) + stats.get("formulas_saved", 0)
                         # fire progress callback with per-file cumulative counts
                         if self.progress_callback:
                             self.progress_callback(
@@ -1157,6 +1514,7 @@ class PDFConverter:
                                 total_pages=total_pages,
                                 images_saved=imgs_by_file[filename],
                                 drawings_saved=dws_by_file[filename],
+                                formulas_saved=formulas_by_file[filename],
                             )
                 except Exception as exc:
                     print(f"Error processing chunk {task_info['page_range']}: {exc}")
@@ -1174,6 +1532,7 @@ class PDFConverter:
         global_stats["table_hyphens_fixed"] += file_stats["table_hyphens_fixed"]
         global_stats["word_count"] += file_stats["word_count"]
         global_stats["char_count"] += file_stats["char_count"]
+        global_stats["formulas_saved"] += file_stats["formulas_saved"]
         global_stats["errors"] += file_stats["errors"]
 
     def _clear_media_folders(
@@ -1202,12 +1561,13 @@ def build_default_config(
     no_drawings: bool = False,
     no_hyphen_fix: bool = False,
     include_metadata: bool = True,
+    no_formulas: bool = False,
 ) -> ConversionConfig:
     """Create a sensible default ``ConversionConfig`` for command‑line use.
 
     Parameters
     ----------
-    no_images, no_drawings, no_hyphen_fix : bool
+    no_images, no_drawings, no_hyphen_fix, no_formulas : bool
         When ``True`` the corresponding extraction/cleanup step is disabled.
     include_metadata : bool
         When ``True`` PDF document metadata is written once at the top of
@@ -1218,8 +1578,9 @@ def build_default_config(
         save_drawings=not no_drawings,
         min_size_px=100,
         bbox_padding=20.0,
-        row_tolerance=15.0,
-        cluster_merge_tolerance=20.0,
+        row_tolerance=0.0195,
+        col_tolerance=0.016,
+        cluster_merge_tolerance=25.0,
         max_items_per_page=10,
         min_items_per_cluster=10,
         include_small_text_blocks=True,
@@ -1252,4 +1613,6 @@ def run_full_conversion(
     print(f"Pages Processed: {pages}")
     print(f"Pages per Second: {pages_per_second:.2f}")
     return global_stats
+
+
 

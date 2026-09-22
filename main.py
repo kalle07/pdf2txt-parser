@@ -48,6 +48,95 @@ logger = logging.getLogger("pdf_parser")
 # --------------------------------------------------------------------------- #
 ProgressEvent, EVT_PROGRESS = wx.lib.newevent.NewEvent()
 
+
+
+
+
+class PDFFolderDropTarget(wx.FileDropTarget):
+    """Collects dropped files/folders, filters for .pdf only."""
+
+    def __init__(self, window: wx.Window) -> None:
+        super().__init__()
+        self._window = window
+
+    def _collect_pdfs(self, path: str) -> List[str]:
+        lower = path.lower()
+
+        if lower.endswith(".pdf"):
+            return [path]
+
+        if os.path.isdir(path):
+            pdfs: List[str] = []
+
+            for root, _, files in os.walk(path):
+                for f in files:
+                    if f.lower().endswith(".pdf"):
+                        full = os.path.normpath(os.path.join(root, f))
+                        pdfs.append(full)
+
+            return pdfs
+
+        return []
+
+    def _set_highlight(self, enabled: bool) -> None:
+        panel = self._window._file_list_panel
+        file_list = self._window.file_list
+
+        if enabled:
+            highlight = wx.Colour(0xE8, 0xF4, 0xE8)
+
+            panel.SetBackgroundColour(highlight)
+            file_list.SetBackgroundColour(highlight)
+
+        else:
+            panel.SetBackgroundColour(
+                self._window._theme.get(
+                    "border_grey",
+                    self._window._theme["panel_bg"],
+                )
+            )
+            file_list.SetBackgroundColour(
+                self._window._theme.get(
+                    "list_bg",
+                    self._window._theme["reader_bg"],
+                )
+            )
+
+        panel.Refresh()
+        file_list.Refresh()
+        panel.Update()
+        file_list.Update()
+
+    def OnEnter(self, x: int, y: int, d: int) -> int:
+        self._set_highlight(True)
+        return d
+
+    def OnDragOver(self, x: int, y: int, d: int) -> int:
+        self._set_highlight(True)
+        return d
+
+    def OnLeave(self) -> None:
+        self._set_highlight(False)
+
+    def OnDropFiles(self, x: int, y: int, paths: List[str]) -> bool:
+        self._set_highlight(False)
+
+        all_pdfs: List[str] = []
+
+        for path in paths:
+            all_pdfs.extend(self._collect_pdfs(path))
+
+        if all_pdfs:
+            wx.CallAfter(self._window._add_to_list, all_pdfs)
+
+        return True
+
+
+
+
+
+
+
 # --------------------------------------------------------------------------- #
 #  Per‑file scan info
 # --------------------------------------------------------------------------- #
@@ -182,13 +271,11 @@ class ScanThread(Thread):
 #  Help / info text
 # --------------------------------------------------------------------------- #
 HELP_TEXT = """\
-	PDF to TXT Converter — Layout Focus & Table/JSON & Media Extraction
-	Refactored class-based architecture with multiprocessing support
-
-	This is a REFACTOR version (modular, maintainable, parallel-ready)
+    PDF to TXT Converter — Layout Focus & Table/JSON & Media Extraction
+    
 
 • The generated TXT file has the same name as the PDF file.
-• The TXT file and media folders with images/drawings are created in the same directory.
+• The TXT file and media folders with images/drawings/formulas are created in the same directory.
 • Older TXT files will be overwritten without prompting.
 • When selecting a folder, all .pdf files inside it (non-hidden) are processed.
 
@@ -200,14 +287,16 @@ If:
 [INFO] File completed: TEST.pdf (X pages)!
 [INFO] Processing completed
 -> This only means all pages were processed; image/drawing/table quality is not guaranteed.
--> If you cannot select and copy the text from the PDF, this program will produce poor results.
+-> If you cannot select and copy the text from your PDF, this program will produce poor results.
 -> No OCR or AI-based recognition — pure pymupdf extraction only.
--> No formulas
 
 Layout & Content Rules:
 • An attempt is made to reproduce page layout in columns (left → right) and blocks (top → bottom).
-• Two common types of tables with detectable structure are extracted; headers are assigned and stored as JSON inside the TXT file.
+• Not straight markdown format, so two columns are not side by side (visual) but one above the other -> this is essential for embedding.
+• some common types of tables with detectable structure are extracted and stored as JSON inside the TXT file -> best for embedding.
+• Only join words split by a hyphen at the end of a line -> best for embedding.
 • Adds "Page X of Y" label at the beginning of every processed page.
+• Experimental, only formlas made with ms-office are saved as image
 
 Image/Drawings Extraction:
 • Images below 100 px on any side are skipped by default (adjustable via config).
@@ -216,17 +305,17 @@ Image/Drawings Extraction:
 • Max 10 media items per page to prevent cluttered output.
 
 Drawing Extraction:
-• A "drawing" requires at least 10 drawing rectangles clustered together (configurable via min_items_per_cluster).
-• Small text blocks near drawings may be merged into the cluster for context but do NOT count toward the minimum.
-• Drawings are saved with padding around their bounding box for visual clarity.
+• A "drawing" requires at least 10 drawing rectangles clustered together (only configurable via min_items_per_cluster in python-file).
+• Small blocks of text near drawings are incorporated into the cluster for contextual reasons.
+• Drawings are saved with a border around their bounding box to accommodate captions or figure labels.
 
 Margin & Overlap Protection:
-• Content whose center falls within outer margins is skipped (configurable thresholds per side).
+• Content whose center falls within outer margins is skipped (configurable thresholds per side only in python-file).
 • Tables take precedence — text blocks and drawings overlapping a table area by >90% are discarded.
 • Images vs Drawings conflict resolution keeps the larger item; smaller one is logged as skipped.
 
 Post-Processing Mode:
-• First: describe all images and drawings oc with help of Ai (Suggestion: LFM2.5-VL-1.6B)
+• First: describe all images and drawings beeing saved oc with help of Ai (Suggestion: LFM2.5-VL-1.6B)
 • This second pass reads existing text files with-in pdf media-folder same name as the PDF and injects a description field alongside each image/drawing JSON block.
 example: testfile_page_0003_img_02.png -> testfile_page_0003_img_02.txt
 
@@ -261,6 +350,7 @@ class PDFParserFrame(wx.Frame):
     C_PROCESS  = wx.Colour(0x00, 0x60, 0xC0)   # blue
     C_DONE     = wx.Colour(0x20, 0x80, 0x20)   # dark green  (red/green label – preserved)
     C_ERROR    = wx.Colour(0xCC, 0x00, 0x00)   # red          (red/green label – preserved)
+    C_FEW_CHARS = wx.Colour(0xFF, 0x80, 0x00)  # orange (warning)    
 
     # ---- theme presets ----
     THEME_LIGHT = {
@@ -277,7 +367,7 @@ class PDFParserFrame(wx.Frame):
         "border_white": wx.Colour(0xFF, 0xFF, 0xFF),  # light border stroke
         "border_grey": wx.Colour(0x80, 0x80, 0x80),  # dark border stroke
         "reader_bg": wx.Colour(0xFF, 0xFF, 0xFF),  # shared reading area
-        "list_bg":  wx.Colour(0xFF, 0xFF, 0xFF),  # white list
+        "list_bg":  wx.Colour(0xD8, 0xD8, 0xD8),  # white list
         "log_bg":   wx.Colour(0xFF, 0xFF, 0xFF),  # white log
         "status_bg": wx.Colour(0xD8, 0xD8, 0xD8),  # status panel
         "btn_start": wx.Colour(0xB4, 0xFF, 0xB4),  # light green
@@ -337,6 +427,11 @@ class PDFParserFrame(wx.Frame):
     )
     THEME_SETTINGS_FILE = "theme_settings.json"
 
+    # columns widths    
+    FILE_COLUMN_MIN_WIDTHS = [160, 50, 80, 70, 60, 70, 60] # need to add new column size if necessary
+
+
+
     def __init__(self) -> None:
         super().__init__(
             parent=None,
@@ -365,6 +460,7 @@ class PDFParserFrame(wx.Frame):
         self._total_files: int = 0
         self._images_saved: int = 0
         self._drawings_saved: int = 0
+        self._formulas_saved: int = 0
         self._start_time: float = 0.0
         self._is_processing: bool = False
 
@@ -375,10 +471,25 @@ class PDFParserFrame(wx.Frame):
         self._per_file_pages_done: Dict[str, int] = {}
         self._per_file_images: Dict[str, int] = {}
         self._per_file_drawings: Dict[str, int] = {}
+        self._per_file_formulas: Dict[str, int] = {}
 
         # running sums updated as scanning completes
         self._total_pages_all: int = 0
         self._total_files_all: int = 0
+
+        self._col_widths: Dict[int, int] = {}
+
+        # File-list sorting state.
+        # First click uses the requested initial direction.
+        self._sort_directions: Dict[int, bool] = {
+            0: False,  # File: A-Z
+            1: False,  # Pages: low-high
+            3: False,  # Status: Ready -> Processing -> Done
+            4: True,   # Images: high-low
+            5: True,   # Drawings: high-low
+            6: True,   # Formulas: high-low
+        }
+        self._sort_column: Optional[int] = None
 
         self._build_ui()
         self._build_context_menu()
@@ -387,9 +498,48 @@ class PDFParserFrame(wx.Frame):
             self._show_help()   # show help text in the viewer on first launch        
         self.Center()
 
+        # Let wx finish the initial layout, then fit all columns.
+        wx.CallAfter(self._pin_file_list_right_edge)        
+
+        # Drop target on the FRAME — catches drops even when app is in background
+        self.SetDropTarget(PDFFolderDropTarget(self))
+
+        self._column_drag_timer = wx.Timer(self)
+        self._column_drag_column = -1
+
+        self.Bind(wx.EVT_TIMER, self._on_column_drag_timer,
+                  self._column_drag_timer)
+
+
+    def _truncate_path_left(self, path: str, max_width: int) -> str:
+        """Return a path shortened from the left, preserving the filename."""
+        if not path:
+            return ""
+
+        dc = wx.ClientDC(self.file_list)
+        dc.SetFont(self.file_list.GetFont())
+
+        if dc.GetTextExtent(path)[0] <= max_width:
+            return path
+
+        prefix = "...\\"
+        remaining = path
+
+        # Remove characters from the left until the complete string fits.
+        while remaining:
+            candidate = prefix + remaining
+            if dc.GetTextExtent(candidate)[0] <= max_width:
+                return candidate
+            remaining = remaining[1:]
+
+        return prefix + Path(path).name
+
+
     def _on_window_resize(self, evt: wx.SizeEvent) -> None:
         if evt is not None:
             evt.Skip()
+        if hasattr(self, "file_list"):
+            wx.CallAfter(self._pin_file_list_right_edge)
 
     def _theme_settings_path(self) -> Path:
         base_dir = Path(wx.StandardPaths.Get().GetUserConfigDir()) / "pdf_parser"
@@ -481,7 +631,10 @@ class PDFParserFrame(wx.Frame):
         sizer = wx.BoxSizer(wx.VERTICAL)
         sizer.Add(self._build_toolbar(), 0, wx.ALL | wx.EXPAND, 4)
 
-        sizer.Add(self._build_file_list_panel(), 1, wx.ALL | wx.EXPAND, 4)
+        file_panel = self._build_file_list_panel()
+        file_panel.Bind(wx.EVT_SIZE, self._on_panel_resize)  # <-- ADD THIS
+        sizer.Add(file_panel, 1, wx.ALL | wx.EXPAND, 4)
+
         sizer.Add(self._build_config_panel(), 0, wx.ALL | wx.EXPAND, 4)
         sizer.Add(self._build_status_panel(), 0, wx.ALL | wx.EXPAND, 4)
         sizer.Add(self._build_text_viewer(), 1, wx.ALL | wx.EXPAND, 4)
@@ -489,10 +642,6 @@ class PDFParserFrame(wx.Frame):
         self.SetSizer(sizer)
         self.SetMinSize((640, 480))
         self._apply_theme()
-
-
-
-
 
 
 
@@ -521,7 +670,7 @@ class PDFParserFrame(wx.Frame):
         self._config_panel.SetBackgroundColour(t.get("border_grey", t["panel_bg"]))
         for lbl in (self._lbl_cores, self._lbl_min_size, self._lbl_max_items):
             lbl.SetForegroundColour(t["text"])
-        for chk in (self.chk_images, self.chk_drawings, self.chk_margin,
+        for chk in (self.chk_images, self.chk_drawings, self.chk_formulas, self.chk_margin,
                      self.chk_hyphen, self.chk_metadata, self.chk_post_only):
             chk.SetForegroundColour(t["text"])
             chk.SetBackgroundColour(t["panel_bg"])
@@ -532,7 +681,7 @@ class PDFParserFrame(wx.Frame):
         # status panel
         self._status_panel.SetBackgroundColour(status_bg)
         for lbl in (self.lbl_pdf_left, self.lbl_pages_left, self.lbl_pps,
-                     self.lbl_eta, self.lbl_images, self.lbl_drawings):
+                     self.lbl_eta, self.lbl_images, self.lbl_drawings, self.lbl_formulas):
             lbl.SetForegroundColour(t["text"])
 
         # text viewer
@@ -624,12 +773,38 @@ class PDFParserFrame(wx.Frame):
             panel,
             style=wx.LC_REPORT | wx.LC_HRULES | wx.LC_VRULES,
         )
+
+
+
         self.file_list.InsertColumn(0, "File", width=350)
         self.file_list.InsertColumn(1, "Pages", width=70)
         self.file_list.InsertColumn(2, "Progress", width=120)
         self.file_list.InsertColumn(3, "Status", width=100)
         self.file_list.InsertColumn(4, "Images", width=80)
         self.file_list.InsertColumn(5, "Drawings", width=90)
+        self.file_list.InsertColumn(6, "Formulas", width=80)
+
+
+        self._col_widths = {
+            i: self.file_list.GetColumn(i).GetWidth()
+            for i in range(7)
+        }
+
+
+        self.file_list.Bind(
+            wx.EVT_LIST_COL_BEGIN_DRAG,
+            self._on_file_column_begin_drag,
+        )
+
+        self.file_list.Bind(
+            wx.EVT_LIST_COL_END_DRAG,
+            self._on_file_column_end_drag,
+        )
+
+        self.file_list.Bind(
+            wx.EVT_LIST_COL_CLICK,
+            self._on_file_column_click,
+        )
 
         # events
         self.file_list.Bind(wx.EVT_LIST_ITEM_RIGHT_CLICK, self._on_list_right_click)
@@ -638,9 +813,436 @@ class PDFParserFrame(wx.Frame):
 
         sizer.Add(self.file_list, 1, wx.EXPAND | wx.ALL, 1)
         panel.SetSizer(sizer)
+
+
         return panel
 
-    # ---- config panel (checkboxes + cores + start/stop) ----
+
+
+    # ------------------------------------------------------------------ #
+    #  File-list sorting
+    # ------------------------------------------------------------------ #
+    def _on_file_column_click(self, evt: wx.ListEvent) -> None:
+        """Sort the file list when a column header is clicked."""
+        column = evt.GetColumn()
+
+        # Progress is not a useful sorting column.
+        if column == 2:
+            return
+
+        if column not in (0, 1, 3, 4, 5):
+            return
+
+        # Clicking the same column reverses the direction.
+        # Clicking another column uses its configured initial direction.
+        if self._sort_column == column:
+            descending = not self._sort_directions[column]
+            self._sort_directions[column] = descending
+        else:
+            descending = self._sort_directions[column]
+            self._sort_column = column
+
+        self._sort_file_list(column, descending)
+
+    def _sort_file_list(self, column: int, descending: bool) -> None:
+        """Sort FileInfo objects and rebuild the ListCtrl rows."""
+        if not self.file_info:
+            return
+
+        items = list(self.file_info.values())
+
+        if column == 0:
+            # Alphabetical by filename, case-insensitive.
+            key_func = lambda fi: fi.name.casefold()
+
+        elif column == 1:
+            # Numeric page count.
+            key_func = lambda fi: fi.pages
+
+        elif column == 3:
+            # Requested order:
+            # Ready -> Processing -> Done
+            # Error/Scanning are placed after the normal states.
+            status_order = {
+                "Ready": 0,
+                "Processing": 1,
+                "Done": 2,
+                "Error": 3,
+                "Scanning...": 4,
+            }
+            key_func = lambda fi: status_order.get(fi.status, 99)
+
+        elif column == 4:
+            key_func = lambda fi: self._file_list_number(fi, 4)
+
+        elif column == 5:
+            key_func = lambda fi: self._file_list_number(fi, 5)
+
+        else:
+            return
+
+        items.sort(key=key_func, reverse=descending)
+
+        # Rebuild the dictionary so dictionary index == ListCtrl row.
+        self.file_info = {
+            idx: fi
+            for idx, fi in enumerate(items)
+        }
+
+        # Rebuild the visible list.
+        self.file_list.Freeze()
+        try:
+            self.file_list.DeleteAllItems()
+
+            width = self.file_list.GetColumn(0).GetWidth() - 10
+
+            for idx, fi in self.file_info.items():
+                self.file_list.InsertItem(
+                    idx,
+                    self._truncate_path_left(fi.path, width),
+                )
+
+                self.file_list.SetItem(
+                    idx,
+                    1,
+                    str(fi.pages) if fi.pages else "…",
+                )
+
+                if fi.status == "Error":
+                    progress = "—"
+                    status_text = fi.error or "Error"
+                    colour = self.C_ERROR
+
+                elif fi.status == "Scanning...":
+                    progress = "…"
+                    status_text = fi.status
+                    colour = self.C_SCANNING
+
+                elif fi.status == "Ready":
+                    progress = f"{fi.pages} / 0"
+                    status_text = fi.status
+                    colour = self.C_READY
+
+                elif fi.status == "Processing":
+                    progress = f"{fi.pages - fi.pages_done} / {fi.pages_done}"
+                    status_text = fi.status
+                    colour = self.C_PROCESS
+
+                elif fi.status == "Done":
+                    progress = f"0 / {fi.pages}"
+                    status_text = fi.status
+                    colour = self.C_DONE
+
+                else:
+                    progress = "…"
+                    status_text = fi.status
+                    colour = self.C_PENDING
+
+                self.file_list.SetItem(idx, 2, progress)
+                self.file_list.SetItem(idx, 3, status_text)
+                self.file_list.SetItem(
+                    idx,
+                    4,
+                    self._file_list_media_value(fi, 4),
+                )
+                self.file_list.SetItem(
+                    idx,
+                    5,
+                    self._file_list_media_value(fi, 5),
+                )
+                self.file_list.SetItemTextColour(idx, colour)
+
+        finally:
+            self.file_list.Thaw()
+
+        self._refresh_file_paths()
+
+    def _file_list_number(self, fi: FileInfo, column: int) -> int:
+        """Return numeric value used for media sorting."""
+        if column == 4:
+            return self._per_file_images.get(fi.name, 0)
+
+        if column == 5:
+            return self._per_file_drawings.get(fi.name, 0)
+
+        return 0
+
+    def _file_list_media_value(self, fi: FileInfo, column: int) -> str:
+        """Return current image/drawing count for a row."""
+        return str(self._file_list_number(fi, column))
+
+
+
+    def _on_column_drag_timer(self, _evt: wx.TimerEvent) -> None:
+        """Continuously update the layout while a column divider is dragged."""
+        if not hasattr(self, "file_list"):
+            return
+
+        # if self.file_list.GetColumnCount() != 6:
+        if self.file_list.GetColumnCount() < 1:
+            return
+
+        column = self._column_drag_column
+        if column < 0:
+            return
+
+        current = self.file_list.GetColumn(column).GetWidth()
+        previous = self._col_widths.get(column, current)
+
+        if current == previous:
+            return
+
+
+        # Apply the same balancing logic used by the final drag handler.
+        self._apply_column_drag(column, current)
+
+
+    def _on_file_column_begin_drag(self, evt: wx.ListEvent) -> None:
+        """Start monitoring a native ListCtrl column resize."""
+        self._column_drag_column = evt.GetColumn()
+
+        # Store the widths immediately before native dragging starts.
+        self._col_widths = {
+            i: self.file_list.GetColumn(i).GetWidth()
+            for i in range(self.file_list.GetColumnCount())
+        }
+
+        evt.Skip()
+
+        if not self._column_drag_timer.IsRunning():
+            self._column_drag_timer.Start(15)  # roughly 60–70 updates/sec
+
+
+    def _apply_column_drag(self, column: int, new_width: int) -> None:
+        count = self.file_list.GetColumnCount()
+        min_widths = self.FILE_COLUMN_MIN_WIDTHS
+
+        old_width = self._col_widths.get(column, new_width)
+        delta = new_width - old_width
+
+        if delta == 0:
+            return
+
+        if column == count - 1:
+            # Keep Drawings' right edge fixed.
+            drawings_width = old_width
+            file_old = self._col_widths.get(
+                0,
+                self.file_list.GetColumn(0).GetWidth(),
+            )
+            file_new = max(min_widths[0], file_old + delta)
+
+            self.file_list.SetColumnWidth(0, file_new)
+            self.file_list.SetColumnWidth(column, drawings_width)
+
+            self._col_widths[0] = file_new
+            self._col_widths[column] = drawings_width
+
+        else:
+            neighbour = column + 1
+
+            neighbour_old = self._col_widths.get(
+                neighbour,
+                self.file_list.GetColumn(neighbour).GetWidth(),
+            )
+
+            min_delta = min_widths[column] - old_width
+            max_delta = neighbour_old - min_widths[neighbour]
+
+            actual_delta = max(
+                min_delta,
+                min(delta, max_delta),
+            )
+
+            adjusted_width = old_width + actual_delta
+            neighbour_new = neighbour_old - actual_delta
+
+            self.file_list.SetColumnWidth(column, adjusted_width)
+            self.file_list.SetColumnWidth(neighbour, neighbour_new)
+
+            self._col_widths[column] = adjusted_width
+            self._col_widths[neighbour] = neighbour_new
+
+        self._refresh_file_paths()
+
+
+
+    # --------------------------------------------------------------------------- #
+    #  Excel-style column resizing with the last column pinned to the right
+    # --------------------------------------------------------------------------- #
+    def _on_file_column_end_drag(self, evt: wx.ListEvent) -> None:
+        """Finish a column resize after live updates."""
+        column = evt.GetColumn()
+
+        if self._column_drag_timer.IsRunning():
+            self._column_drag_timer.Stop()
+
+        self._column_drag_column = -1
+
+        # One final layout pass after the native drag has finished.
+        wx.CallAfter(self._pin_file_list_right_edge)
+
+        evt.Skip()
+
+        count = self.file_list.GetColumnCount()
+        #if count != 6 or not (0 <= column < count):
+        if count < 1 or not (0 <= column < count):
+            return
+
+        min_widths = self.FILE_COLUMN_MIN_WIDTHS
+        new_width = self.file_list.GetColumn(column).GetWidth()
+        old_width = self._col_widths.get(column, new_width)
+        delta = new_width - old_width
+        if delta == 0:
+            return
+
+        # The outer/right edge of Drawings is fixed. A drag on that edge is
+        # therefore cancelled; File absorbs the attempted width change.
+        if column == count - 1:
+            drawings_width = old_width
+            file_old = self._col_widths.get(0, self.file_list.GetColumn(0).GetWidth())
+            file_new = max(min_widths[0], file_old + delta)
+            self.file_list.SetColumnWidth(0, file_new)
+            self.file_list.SetColumnWidth(column, drawings_width)
+            self._col_widths[0] = file_new
+            self._col_widths[column] = drawings_width
+            wx.CallAfter(self._pin_file_list_right_edge)
+            return
+
+        # Normal divider: the column to the right absorbs the inverse delta.
+        neighbour = column + 1
+        neighbour_old = self._col_widths.get(
+            neighbour, self.file_list.GetColumn(neighbour).GetWidth()
+        )
+        min_delta = min_widths[column] - old_width
+        max_delta = neighbour_old - min_widths[neighbour]
+
+        actual_delta = max(
+            min_delta,
+            min(delta, max_delta),
+        )
+        new_width = old_width + actual_delta
+        neighbour_new = neighbour_old - actual_delta
+
+        self.file_list.SetColumnWidth(column, new_width)
+        self.file_list.SetColumnWidth(neighbour, neighbour_new)
+        self._col_widths[column] = new_width
+        self._col_widths[neighbour] = neighbour_new
+        wx.CallAfter(self._pin_file_list_right_edge)
+
+
+    def _pin_file_list_right_edge(self) -> None:
+        """Fit all ListCtrl columns inside the available width.
+
+        Column 0 absorbs all remaining space. Other columns retain their
+        current widths where possible, but are reduced proportionally if
+        necessary to prevent horizontal scrolling.
+        """
+        if not hasattr(self, "file_list"):
+            return
+
+        count = self.file_list.GetColumnCount()
+        if count < 1:
+            return
+
+        client_width = self.file_list.GetClientSize().GetWidth()
+        if client_width <= 0:
+            return
+
+        min_widths = self.FILE_COLUMN_MIN_WIDTHS[:count]
+
+        # Small safety allowance for the ListCtrl border/scrollbar.
+        available = max(0, client_width - 2)
+
+        widths = [
+            self.file_list.GetColumn(i).GetWidth()
+            for i in range(count)
+        ]
+
+        total_width = sum(widths)
+
+        # ---------------------------------------------------------------
+        # Case 1: Everything already fits.
+        # Give all remaining space to File (column 0).
+        # ---------------------------------------------------------------
+        if total_width <= available:
+            extra = available - total_width
+            widths[0] += extra
+
+        # ---------------------------------------------------------------
+        # Case 2: Columns are too wide.
+        # First shrink columns 1..N until everything fits.
+        # Column 0 is kept at its minimum.
+        # ---------------------------------------------------------------
+        else:
+            deficit = total_width - available
+
+            # Shrink the non-file columns first, starting from the right.
+            for i in range(count - 1, 0, -1):
+                reducible = max(0, widths[i] - min_widths[i])
+                take = min(deficit, reducible)
+
+                widths[i] -= take
+                deficit -= take
+
+                if deficit <= 0:
+                    break
+
+            # If there is still a deficit, shrink File as a last resort.
+            if deficit > 0:
+                reducible = max(0, widths[0] - min_widths[0])
+                take = min(deficit, reducible)
+                widths[0] -= take
+                deficit -= take
+
+        # Apply widths.
+        for i, width in enumerate(widths):
+            width = max(min_widths[i], int(width))
+            self.file_list.SetColumnWidth(i, width)
+            self._col_widths[i] = width
+
+        self._refresh_file_paths()
+
+
+    def _resize_file_column(self) -> None:
+        self._pin_file_list_right_edge()
+
+    def _on_panel_resize(self, evt: wx.SizeEvent) -> None:
+        evt.Skip()
+        wx.CallAfter(self._pin_file_list_right_edge)
+
+
+    # ------------------------------------------------------------------
+    #  Drag‑and‑drop visual feedback (file list panel only)
+    # ------------------------------------------------------------------
+    def _on_drag_enter_file_list(self, evt: wx.MouseEvent) -> None:
+        self._file_list_panel.SetBackgroundColour(wx.Colour(0xE8, 0xF4, 0xE8))
+        self._file_list_panel.Refresh()
+        evt.Skip()
+
+    def _on_drag_leave_file_list(self, evt: wx.MouseEvent) -> None:
+        self._file_list_panel.SetBackgroundColour(self._theme.get("border_grey", self._theme["panel_bg"]))
+        self._file_list_panel.Refresh()
+        evt.Skip()
+
+
+    def _refresh_file_paths(self) -> None:
+        """Refresh displayed paths using left-side truncation."""
+        if not hasattr(self, "file_list"):
+            return
+
+        width = self.file_list.GetColumn(0).GetWidth() - 10
+
+        for idx, fi in self.file_info.items():
+            if idx < self.file_list.GetItemCount():
+                self.file_list.SetItem(
+                    idx,
+                    0,
+                    self._truncate_path_left(fi.path, width),
+                )
+
+
+
     # ---- config panel (checkboxes + cores + start/stop) ----
     def _build_config_panel(self) -> wx.Panel:
         panel = wx.Panel(self, style=wx.BORDER_SUNKEN)
@@ -651,46 +1253,142 @@ class PDFParserFrame(wx.Frame):
         left_col = wx.BoxSizer(wx.VERTICAL)
 
         cb_row1 = wx.BoxSizer(wx.HORIZONTAL)
+
         self.chk_images = wx.CheckBox(panel, label="Save images")
         self.chk_images.SetValue(False)
+        self.chk_images.SetToolTip(
+            "Extract and save raster images found in the PDF."
+        )
+
         self.chk_drawings = wx.CheckBox(panel, label="Save drawings")
         self.chk_drawings.SetValue(False)
+        self.chk_drawings.SetToolTip(
+            "Detect and save vector drawings found in the PDF."
+        )
+
+        self.chk_formulas = wx.CheckBox(panel, label="Save formulas")
+        self.chk_formulas.SetValue(False)
+        self.chk_formulas.SetToolTip(
+            "Extract the Cambria Maths font/formula if the PDF file was saved from an Office .docx document."
+        )
+
         self.chk_margin = wx.CheckBox(panel, label="Enable margin check")
         self.chk_margin.SetValue(True)
-        for chk in (self.chk_images, self.chk_drawings, self.chk_margin):
+        self.chk_margin.SetToolTip(
+            "Ignores ~5% of the page margins"
+        )
+
+        for chk in (self.chk_images, self.chk_drawings, self.chk_formulas, self.chk_margin):
             cb_row1.Add(chk, 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 2)
+
         left_col.Add(cb_row1, 0, wx.EXPAND | wx.BOTTOM, 4)
 
+        # -------- second row --------
         cb_row2 = wx.BoxSizer(wx.HORIZONTAL)
+
         self.chk_hyphen = wx.CheckBox(panel, label="Fix hyphenated words")
         self.chk_hyphen.SetValue(True)
+        self.chk_hyphen.SetToolTip(
+            "Join words split by a hyphen at the end of a line."
+        )
+
         self.chk_metadata = wx.CheckBox(panel, label="Include metadata")
         self.chk_metadata.SetValue(True)
+        self.chk_metadata.SetToolTip(
+            "Include PDF metadata such as title, author and document information."
+        )
+
+        self.chk_post_only = wx.CheckBox(
+            panel,
+            label="Post-process only (no PDF)",
+        )
+        self.chk_post_only.SetValue(False)
         # Post-process-only mode: fill image/drawing descriptions from the
         # existing .txt + _media folders. The source PDF is not opened, so this
-        # works on a folder of already-converted output with no re-conversion.
-        self.chk_post_only = wx.CheckBox(panel, label="Post-process only (no PDF)")
-        self.chk_post_only.SetValue(False)
+        # works on a folder of already-converted output with no re-conversion.        
         self.chk_post_only.SetToolTip(
-            "Skip conversion. Fill image/drawing descriptions from existing "
-            ".txt files and their _media folders. The source PDF is not needed."
+            "Process existing TXT and _media folders only. "
+            "The source PDF is not opened or converted."
         )
-        for chk in (self.chk_hyphen, self.chk_metadata, self.chk_post_only):
+
+        for chk in (
+            self.chk_hyphen,
+            self.chk_metadata,
+            self.chk_post_only,
+        ):
             cb_row2.Add(chk, 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 2)
+
         left_col.Add(cb_row2, 0, wx.EXPAND | wx.BOTTOM, 4)
 
+        # -------- image options --------
         opts_row = wx.BoxSizer(wx.HORIZONTAL)
-        self._lbl_min_size = wx.StaticText(panel, label="Image min size px:")
-        opts_row.Add(self._lbl_min_size, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
-        self.spin_min_size = wx.SpinCtrl(panel, value="100", min=10, max=5000)
-        self.spin_min_size.SetMinSize((68, -1))
-        opts_row.Add(self.spin_min_size, 0, wx.RIGHT, 12)
 
-        self._lbl_max_items = wx.StaticText(panel, label="Max images/page:")
-        opts_row.Add(self._lbl_max_items, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
-        self.spin_max_items = wx.SpinCtrl(panel, value="10", min=1, max=100)
+        self._lbl_min_size = wx.StaticText(
+            panel,
+            label="Image/Drawing min size px:",
+        )
+        self._lbl_min_size.SetToolTip(
+            "Minimum width and height of an image/drawing to be saved. "
+            "Images smaller than this size are skipped."
+        )
+
+        opts_row.Add(
+            self._lbl_min_size,
+            0,
+            wx.ALIGN_CENTER_VERTICAL | wx.RIGHT,
+            4,
+        )
+
+        self.spin_min_size = wx.SpinCtrl(
+            panel,
+            value="100",
+            min=10,
+            max=5000,
+        )
+        self.spin_min_size.SetMinSize((68, -1))
+        self.spin_min_size.SetToolTip(
+            "Minimum image/drawing size in pixels. "
+            "Example: 100 skips images smaller than 100 px on either side."
+        )
+        opts_row.Add(
+            self.spin_min_size,
+            0,
+            wx.RIGHT,
+            12,
+        )
+
+        self._lbl_max_items = wx.StaticText(
+            panel,
+            label="Max images(drawings)/page:",
+        )
+        self._lbl_max_items.SetToolTip(
+            "Maximum number of images saved from a single PDF page."
+        )
+
+        opts_row.Add(
+            self._lbl_max_items,
+            0,
+            wx.ALIGN_CENTER_VERTICAL | wx.RIGHT,
+            4,
+        )
+
+        self.spin_max_items = wx.SpinCtrl(
+            panel,
+            value="10",
+            min=1,
+            max=100,
+        )
         self.spin_max_items.SetMinSize((68, -1))
-        opts_row.Add(self.spin_max_items, 0, wx.ALL, 2)
+        self.spin_max_items.SetToolTip(
+            "Maximum number of image/media items that can be saved from one page."
+        )
+
+        opts_row.Add(
+            self.spin_max_items,
+            0,
+            wx.ALL,
+            2,
+        )
 
         left_col.Add(opts_row, 0, wx.EXPAND)
         sizer.Add(left_col, 1, wx.ALL | wx.EXPAND, 4)   # proportional so it takes remaining space
@@ -745,7 +1443,8 @@ class PDFParserFrame(wx.Frame):
         info_row2 = wx.BoxSizer(wx.HORIZONTAL)
         self.lbl_images = wx.StaticText(panel, label="Images saved: 0")
         self.lbl_drawings = wx.StaticText(panel, label="Drawings saved: 0")
-        for lbl in (self.lbl_images, self.lbl_drawings):
+        self.lbl_formulas = wx.StaticText(panel, label="Formulas saved: 0")
+        for lbl in (self.lbl_images, self.lbl_drawings, self.lbl_formulas):
             info_row2.Add(lbl, 1, wx.ALL | wx.ALIGN_CENTER, 2)
         sizer.Add(info_row2, 0, wx.EXPAND)
 
@@ -779,6 +1478,10 @@ class PDFParserFrame(wx.Frame):
     def _build_log_panel(self) -> wx.Panel:
         panel = wx.Panel(self, style=wx.BORDER_SUNKEN)
         self._log_panel = panel
+
+        # Minimum/initial height of the log area.
+        panel.SetMinSize((-1, 100))
+
         sizer = wx.BoxSizer(wx.VERTICAL)
 
         self.lbl_log = wx.StaticText(panel, label="Log")
@@ -819,7 +1522,15 @@ class PDFParserFrame(wx.Frame):
             idx = self.file_list.GetItemCount()
             fi = FileInfo(path=p, name=Path(p).stem)  # stem matches converter's pdf_filename
             self.file_info[idx] = fi
-            self.file_list.InsertItem(idx, fi.name)
+
+            self.file_list.InsertItem(
+                idx,
+                self._truncate_path_left(
+                    fi.path,
+                    self.file_list.GetColumn(0).GetWidth() - 10,
+                ),
+            )
+
             self.file_list.SetItem(idx, 1, "…")
             self.file_list.SetItem(idx, 2, "…")
             self.file_list.SetItem(idx, 3, fi.status)
@@ -1039,6 +1750,7 @@ class PDFParserFrame(wx.Frame):
 
         save_images = self.chk_images.GetValue()
         save_drawings = self.chk_drawings.GetValue()
+        save_formulas = self.chk_formulas.GetValue()
 
         # remove stale .txt so assemble_results rewrites from scratch
         for pdf_path in pdf_files:
@@ -1050,6 +1762,7 @@ class PDFParserFrame(wx.Frame):
         config = ConversionConfig(
             save_images=save_images,
             save_drawings=save_drawings,
+            save_formulas=save_formulas,
             enable_margin_check=self.chk_margin.GetValue(),
             hyphen_fix_enabled=self.chk_hyphen.GetValue(),
             include_metadata=self.chk_metadata.GetValue(),
@@ -1064,9 +1777,11 @@ class PDFParserFrame(wx.Frame):
         self._files_done = 0
         self._images_saved = 0
         self._drawings_saved = 0
+        self._formulas_saved = 0
         self._per_file_pages_done.clear()
         self._per_file_images.clear()
         self._per_file_drawings.clear()
+        self._per_file_formulas.clear()
         self._start_time = time.time()
         self._is_processing = True
 
@@ -1175,6 +1890,7 @@ class PDFParserFrame(wx.Frame):
         total_pages: int,
         images_saved: int,
         drawings_saved: int,
+        formulas_saved: int = 0,
     ) -> None:
         """Throttled wrapper: limits progress updates to ~10/sec.
 
@@ -1192,6 +1908,7 @@ class PDFParserFrame(wx.Frame):
             total_pages=total_pages,
             images_saved=images_saved,
             drawings_saved=drawings_saved,
+            formulas_saved=formulas_saved,
         )
 
     def _on_progress(
@@ -1201,6 +1918,7 @@ class PDFParserFrame(wx.Frame):
         total_pages: int,
         images_saved: int,
         drawings_saved: int,
+        formulas_saved: int = 0,
     ) -> None:
         """Called from the worker thread after every page.
 
@@ -1213,6 +1931,7 @@ class PDFParserFrame(wx.Frame):
             total_pages=total_pages,
             images_saved=images_saved,
             drawings_saved=drawings_saved,
+            formulas_saved=formulas_saved,
             pdf_filename=pdf_filename,
         )
 
@@ -1222,16 +1941,18 @@ class PDFParserFrame(wx.Frame):
         total_pages: int,
         images_saved: int,
         drawings_saved: int,
-        pdf_filename: str,
+        formulas_saved: int = 0,
+        pdf_filename: str = "", 
     ) -> None:
         """GUI‑thread update – called via wx.CallAfter.
 
         Tracks per‑file progress and updates all counters.
         """
-        # pages_done, images_saved, drawings_saved are all per‑file cumulative values
+        # pages_done, images_saved, drawings_saved, formulas_saved are all per‑file cumulative values
         self._per_file_pages_done[pdf_filename] = pages_done
         self._per_file_images[pdf_filename] = images_saved
         self._per_file_drawings[pdf_filename] = drawings_saved
+        self._per_file_formulas[pdf_filename] = formulas_saved
 
         # update per‑file progress display
         for idx, fi in self.file_info.items():
@@ -1241,11 +1962,13 @@ class PDFParserFrame(wx.Frame):
                 self.file_list.SetItem(idx, 2, f"{fi.pages - fi.pages_done} / {fi.pages_done}")
                 self.file_list.SetItem(idx, 4, str(images_saved))
                 self.file_list.SetItem(idx, 5, str(drawings_saved))
+                self.file_list.SetItem(idx, 6, str(formulas_saved))
                 break
 
         # update cumulative totals shown in the status panel (sum of all files)
         self._images_saved = sum(self._per_file_images.values())
         self._drawings_saved = sum(self._per_file_drawings.values())
+        self._formulas_saved = sum(self._per_file_formulas.values())
 
         # global pages_done = sum of all per‑file pages_done
         self._pages_done = sum(self._per_file_pages_done.values())
@@ -1253,6 +1976,7 @@ class PDFParserFrame(wx.Frame):
         # update status panel labels with cumulative totals
         self.lbl_images.SetLabel(f"Images saved: {self._images_saved}")
         self.lbl_drawings.SetLabel(f"Drawings saved: {self._drawings_saved}")
+        self.lbl_formulas.SetLabel(f"Formulas saved: {self._formulas_saved}")
 
         # ---- rolling 1‑second pages/sec mean ----
         now = time.time()
@@ -1297,6 +2021,7 @@ class PDFParserFrame(wx.Frame):
         self.lbl_eta.SetLabel(f"ETA: {_fmt_time(eta_secs)} | Real: {_fmt_time(elapsed)}")
         self.lbl_images.SetLabel(f"Images saved: {self._images_saved}")
         self.lbl_drawings.SetLabel(f"Drawings saved: {self._drawings_saved}")
+        self.lbl_formulas.SetLabel(f"Formulas saved: {self._formulas_saved}")
 
         pct = int(self._pages_done / self._total_pages * 100) if self._total_pages else 0
         self.progress.SetValue(pct)
@@ -1333,6 +2058,9 @@ class PDFParserFrame(wx.Frame):
 
         per_file = (stats or {}).get("per_file", {})
 
+        # Track if any files had low character density
+        low_char_files = []
+
         # force every remaining Processing file to Done and write final per‑file counts
         for idx, fi in self.file_info.items():
             if fi.status == "Processing":
@@ -1342,11 +2070,30 @@ class PDFParserFrame(wx.Frame):
                 self.file_list.SetItem(idx, 3, fi.status)
                 self.file_list.SetItemTextColour(idx, self.C_DONE)
 
-            # write final images / drawings for this file
+            # write final images / drawings / formulas for this file
             if fi.name in per_file:
                 fs = per_file[fi.name]
                 self.file_list.SetItem(idx, 4, str(fs.get("images_saved", 0)))
                 self.file_list.SetItem(idx, 5, str(fs.get("drawings_saved", 0)))
+                self.file_list.SetItem(idx, 6, str(fs.get("formulas_saved", 0)))
+
+                # --- New Logic: Check Character Density ---
+                char_count = fs.get("char_count", 0)
+                pages_processed = fs.get("pages_processed", 0)
+                
+                if pages_processed > 0:
+                    avg_chars = char_count / pages_processed
+                    if avg_chars < 100:
+                        fi.status = "Few Chars"
+                        self.file_list.SetItem(idx, 3, fi.status)
+                        self.file_list.SetItemTextColour(idx, self.C_FEW_CHARS)
+                        low_char_files.append((fi.name, avg_chars))
+                # -------------------------------------------
+
+        # Log messages for low character density files
+        if low_char_files:
+            for name, avg in low_char_files:
+                self._log(f"Warning: '{name}' has low text density ({avg:.1f} chars/page).")
 
         # sync final counts so status labels show zero
         self._pages_done = self._total_pages
@@ -1359,6 +2106,7 @@ class PDFParserFrame(wx.Frame):
         self._enable_ui(True)
         self.converter_thread = None
 
+
     def _enable_ui(self, enable: bool) -> None:
         self.btn_start.Enable(enable)
         self.btn_cancel.Enable(not enable)
@@ -1366,7 +2114,7 @@ class PDFParserFrame(wx.Frame):
         self.btn_add_folder.Enable(enable)
         self.btn_remove.Enable(enable)
         self.btn_clear.Enable(enable)
-        for chk in (self.chk_images, self.chk_drawings, self.chk_margin,
+        for chk in (self.chk_images, self.chk_drawings, self.chk_formulas, self.chk_margin,
                      self.chk_hyphen, self.chk_metadata, self.chk_post_only):
             chk.Enable(enable)
         self.spin_cores.Enable(enable)
@@ -1408,3 +2156,8 @@ def main() -> None:
 if __name__ == "__main__":
     multiprocessing.freeze_support()
     main()
+
+
+
+
+

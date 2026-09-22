@@ -16,7 +16,7 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 ENTRY_POINT = PROJECT_ROOT / "main.py"
-APP_NAME = "PDFParser"
+APP_NAME = "PDFParser-by-kalle07"
 
 
 def main() -> None:

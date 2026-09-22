@@ -1,7 +1,7 @@
 """Overlap, distance, and margin checks for parsed PDF regions."""
 
 import math
-from typing import Any, Tuple
+from typing import Any, List, Optional, Tuple
 
 from layout import BoundingBox
 
@@ -129,3 +129,153 @@ def is_high_overlap_similar_size(
     if size_diff_ratio <= size_tolerance:
         return True, overlap_pct
     return False, overlap_pct
+
+
+# PDF points to CSS/screen pixels:
+# 72 points per PDF inch, 96 pixels per screen inch.
+PX_TO_POINTS = 72.0 / 96.0
+
+
+def _count_nonempty_lines(text: str) -> int:
+    """Return the number of non-empty lines in a text block."""
+    return len([line for line in text.splitlines() if line.strip()])
+
+
+def is_small_text_block(
+    text: str,
+    max_lines: int = 2,
+    max_chars: int = 250,
+) -> bool:
+    """
+    Return True when a text block is small enough to be a table caption.
+
+    A block is considered small when:
+    - it has at most ``max_lines`` non-empty lines, and
+    - its stripped text length is at most ``max_chars`` characters.
+    """
+    if text is None:
+        return False
+
+    stripped = text.strip()
+    if not stripped:
+        return False
+
+    if len(stripped) > max_chars:
+        return False
+
+    if _count_nonempty_lines(stripped) > max_lines:
+        return False
+
+    return True
+
+
+def horizontal_overlap_width(
+    bbox1: BoundingBox,
+    bbox2: BoundingBox,
+) -> float:
+    """Return the width of the horizontal intersection of two boxes."""
+    inter_x0 = max(bbox1.x0, bbox2.x0)
+    inter_x1 = min(bbox1.x1, bbox2.x1)
+    return max(0.0, inter_x1 - inter_x0)
+
+
+def vertical_gap_above_table(
+    table_bbox: BoundingBox,
+    text_bbox: BoundingBox,
+) -> float:
+    """
+    Return the vertical gap between a text block and the top of a table.
+
+    Positive value: text is above the table.
+    Negative value: text overlaps below the table top.
+    """
+    return table_bbox.y0 - text_bbox.y1
+
+
+def vertical_gap_below_table(
+    table_bbox: BoundingBox,
+    text_bbox: BoundingBox,
+) -> float:
+    """
+    Return the vertical gap between the bottom of a table and a text block.
+
+    Positive value: text is below the table.
+    Negative value: text overlaps above the table bottom.
+    """
+    return text_bbox.y0 - table_bbox.y1
+
+
+def is_close_above_table(
+    table_bbox: BoundingBox,
+    text_bbox: BoundingBox,
+    max_distance_px: float = 10.0,
+    max_overlap_px: float = 5.0,
+    require_horizontal_overlap: bool = True,
+) -> bool:
+    """
+    Return True when a text block is close above a table.
+
+    The text block must:
+    - be vertically close to the table top,
+    - not overlap the table top by more than ``max_overlap_px``,
+    - and, by default, horizontally overlap the table.
+    """
+    gap = vertical_gap_above_table(table_bbox, text_bbox)
+
+    if gap > max_distance_px:
+        return False
+
+    if gap < -max_overlap_px:
+        return False
+
+    if require_horizontal_overlap:
+        if horizontal_overlap_width(table_bbox, text_bbox) <= 0.0:
+            return False
+
+    return True
+
+
+def is_close_below_table(
+    table_bbox: BoundingBox,
+    text_bbox: BoundingBox,
+    max_distance_px: float = 10.0,
+    max_overlap_px: float = 2.0,
+    require_horizontal_overlap: bool = True,
+) -> bool:
+    """
+    Return True when a text block is close below a table.
+
+    The text block must:
+    - be vertically close to the table bottom,
+    - not overlap the table bottom by more than ``max_overlap_px``,
+    - and, by default, horizontally overlap the table.
+    """
+    max_distance_pt = max_distance_px * PX_TO_POINTS
+    max_overlap_pt = max_overlap_px * PX_TO_POINTS
+
+    gap = vertical_gap_below_table(table_bbox, text_bbox)
+
+    if gap > max_distance_pt:
+        return False
+
+    if gap < -max_overlap_pt:
+        return False
+
+    if require_horizontal_overlap:
+        if horizontal_overlap_width(table_bbox, text_bbox) <= 0.0:
+            return False
+
+    return True
+
+
+def combine_nonempty_texts(*parts: Optional[str]) -> Optional[str]:
+    """
+    Join non-empty text parts with newlines.
+
+    Returns ``None`` when no part contains meaningful text.
+    """
+    cleaned = [part.strip() for part in parts if part and part.strip()]
+    if not cleaned:
+        return None
+    return "\n".join(cleaned)
+
