@@ -5,6 +5,7 @@ import logging
 import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
+import unicodedata
 
 logger = logging.getLogger("pdf_parser.post_process")
 
@@ -14,22 +15,200 @@ logger = logging.getLogger("pdf_parser.post_process")
 DEFAULT_TARGET_KEYS = ("drawings_with_resolution", "images_with_resolution", "formulas_on_page")
 
 
-def remove_nonprintable_chars(text: str) -> str:
-    """Remove non-printable/control characters while preserving Unicode."""
-    # Ensure we are working with a string (e.g., convert non‑str inputs)
+
+
+def _is_printable_neighbor(ch: str) -> bool:
+    """Return True if ch is a visible printable character.
+
+    This intentionally excludes whitespace and control characters.
+    """
+    if not ch:
+        return False
+    return ch.isprintable() and not ch.isspace()
+
+# softhyphen is not always good
+def _replace_soft_hyphens_contextually(text: str) -> str:
+    """Replace soft hyphens based on their context.
+
+    Rules:
+    - Soft hyphen at the end of a line becomes a normal hyphen.
+    - Soft hyphen followed by a printable non-space character is removed.
+    - Otherwise it becomes a normal hyphen.
+    """
+    if not text or "\u00ad" not in text:
+        return text
+
+    # Soft hyphen at end of line, optionally followed by spaces/tabs.
+    # This makes it behave like a normal line-end hyphen.
+    text = re.sub(r"\u00ad[ \t]*(?=\n|$)", "-", text)
+
+    if "\u00ad" not in text:
+        return text
+
+    result: list[str] = []
+    n = len(text)
+
+    for i, ch in enumerate(text):
+        if ch != "\u00ad":
+            result.append(ch)
+            continue
+        
+        # left = text[i - 1] if i > 0 else ""
+        right = text[i + 1] if i + 1 < n else ""
+
+        if right.isprintable() and not right.isspace(): # soft hyphen are bulshit _is_printable_neighbor(left):# and _is_printable_neighbor(right):
+            # Mid-word soft hyphen: remove it.
+            result.append("")
+        else:
+            # Otherwise keep it as a visible hyphen.
+            result.append("-")
+
+    return "".join(result)
+
+def remove_nonprintable_chars(text: str, preserve_line_breaks: bool = False) -> str:
+    """Clean non-printable / control characters while preserving positional mapping.
+
+    Rules (in order):
+
+    1. ``\\r`` and ``\\r\\n`` → ``\\n`` (CRLF normalisation).
+    2. Char-joiner / zero-width characters → removed entirely (no visual width,
+       so deletion does not shift any visible character's position).
+    3. Soft hyphen contextual replacement:
+       - If the immediate left and right neighbours are printable characters,
+         replace ``\\u00ad`` with ``""``.
+       - Otherwise replace ``\\u00ad`` with ``"-"`` so it behaves like a normal hyphen.
+    4. A narrow set of control characters at the start of a line → ``\\u2022``
+       (bullet anchor for highlight-marker injection). All other Cc chars
+       — and every Cf / non-printable — become ``" "`` to keep 1:1 positional
+       mapping with the original text.
+    5. Unicode space-like characters → regular ``" "``.
+    6. *Every* line break becomes a space; runs longer than 3 collapse to exactly 3.
+    7. Collapsible horizontal whitespace runs → single space, then strip.
+    """
     if not isinstance(text, str):
         text = str(text)
 
-    # Collapse Windows line endings and replace them with a single space
-    cleaned = re.sub(r"[\r\n]+", " ", text)
-    # Remove ASCII control characters except line feed and vertical tab
-    cleaned = re.sub(r"[\x01-\x08\x0B\x0C\x0E-\x1F]", "", cleaned)
-    # Replace tabs with a single space
-    cleaned = cleaned.replace("\t", " ")
-    # Collapse any sequence of spaces into a single space
-    cleaned = re.sub(r" +", " ", cleaned)
-    # Strip leading/trailing whitespace
-    return cleaned.strip()
+    # ── Step 1 : CRLF / lone CR → LF ─────────────────────────────────────────
+    cleaned = text.replace("\r\n", "\n").replace("\r", "\n")
+
+    # ── Step 2 : delete zero-width / char-joiner characters entirely ───────────
+    # NOTE: soft hyphen is intentionally NOT removed here.
+    # It is handled contextually in Step 3.
+    _ZERO_WIDTH_CHARS = frozenset({
+        "\u200b",  # zero-width space (ZWS)
+        "\u200c",  # zero-width non-joiner (ZWNJ)
+        "\u200d",  # zero-width joiner   (ZWJ)
+        "\u2060",  # word joiner         (WJ)
+        "\ufeff",  # byte-order mark     (BOM / NBSP variant)
+        # "\u00ad", # agressive softhypen remove
+    })
+
+    cleaned = "".join(
+        "" if ch in _ZERO_WIDTH_CHARS else ch
+        for ch in cleaned
+    )
+
+    # ── Step 3 : contextual soft-hyphen replacement ─────────────────────────────
+    cleaned = _replace_soft_hyphens_contextually(cleaned)
+
+    # ── Step 4 : one-to-one character replacement ──────────────────────────────
+    _UNICODE_SPACES = frozenset({
+        "\u00a0", "\u1680",
+        "\u2000", "\u2001", "\u2002", "\u2003", "\u2004",
+        "\u2005", "\u2006", "\u2007", "\u2008", "\u2009",
+        "\u200a", "\u202f", "\u205f", "\u3000",
+    })
+
+    result: list[str] = []
+    at_line_start = True
+
+    for ch in cleaned:
+        if ch == "\n":
+            result.append(ch)
+            at_line_start = True
+            continue
+
+        if ch in _UNICODE_SPACES:
+            result.append(" ")
+            at_line_start = False
+            continue
+
+        cat = unicodedata.category(ch)
+        
+       
+        if cat == "Cc" or cat == "Cf" or not ch.isprintable():
+            result.append(" ")        # everything else → space, position preserved
+            at_line_start = False
+            continue
+
+        result.append(ch)
+        at_line_start = False
+
+    cleaned = "".join(result)
+
+    # ── Step 5 : YES/NO LAYOUT ─────────────────────────────────────
+    if preserve_line_breaks:
+        # Keep line breaks exactly as they are (after CRLF normalization).
+        pass
+    # collapse runs of newlines
+    else:
+        _NL_RUN = re.compile(r"\n+")
+        cleaned = _NL_RUN.sub(lambda m: " " * min(len(m.group()), 3), cleaned)
+
+    # ── Step 6 : collapse horizontal whitespace and strip ───────────────────────
+    _COLLAPSIBLE_HORIZON = re.compile(r"[ \t]+")
+    return _COLLAPSIBLE_HORIZON.sub(" ", cleaned).strip()
+
+
+def fix_hyphenated_lines(text: str) -> Tuple[str, int]:
+    """Fix hyphenated line breaks while preserving paragraph structure.
+
+    Handles both normal hyphen and soft hyphen at line end:
+
+        ex-\nample  -> example
+        ex\u00ad\nample -> example
+
+    Single line breaks are left as line breaks here. Later,
+    `remove_nonprintable_chars()` converts single line breaks to spaces
+    while preserving multiple line breaks.
+    """
+    if not isinstance(text, str):
+        return text, 0
+
+    # Normalize line endings before processing.
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+
+    # Make soft hyphens behave like normal hyphens before hyphen-joining logic. softhyphen some times bad
+    text = _replace_soft_hyphens_contextually(text)
+
+    lines = text.split("\n")
+    fixed_lines: List[str] = []
+    fix_count = 0
+
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+
+        if not line:
+            fixed_lines.append("")
+            i += 1
+            continue
+
+        # Detect normal hyphen or soft hyphen at the end of the line.
+        if re.search(r"[-\u00ad]\s*$", line):
+            next_line = lines[i + 1].strip() if i + 1 < len(lines) else ""
+
+            if next_line:
+                current_clean = re.sub(r"[-\u00ad]\s*$", "", line)
+                fixed_lines.append(current_clean + next_line)
+                fix_count += 1
+                i += 2
+                continue
+
+        fixed_lines.append(line)
+        i += 1
+
+    return "\n".join(fixed_lines), fix_count
 
 
 def count_non_whitespace_chars(text: str) -> int:
@@ -56,47 +235,6 @@ def count_words(text: str) -> int:
     return len(re.findall(r"\b[\w']+\b", text, flags=re.UNICODE))
 
 
-def fix_hyphenated_lines(text: str) -> Tuple[str, int]:
-    """Fix hyphenation issues from PDF line breaks."""
-    if not isinstance(text, str):
-        return text, 0
-
-    fix_count = 0
-    lines = text.split("\n")
-    fixed_lines = []
-
-    i = 0
-    while i < len(lines):
-        line = lines[i].strip()
-
-        # Skip empty lines
-        if not line:
-            fixed_lines.append("")
-            i += 1
-            continue
-
-        # Detect a line that ends with a hyphen (possible PDF line‑break)
-        is_hyphenated_split = bool(re.match(r"^.*-\s*$", line)) or bool(re.match(r"^.*-$", line))
-        # If it is hyphenated and there is a following line, attempt to join them
-        if is_hyphenated_split and i + 1 < len(lines):
-            next_line = lines[i + 1].strip()
-            if next_line:
-                # Remove trailing hyphen and surrounding whitespace from the current line
-                current_clean = re.sub(r"\s*-\s*$", "", line)
-                # Join the cleaned current line with the next line
-                joined_word = f"{current_clean}{next_line}"
-                fixed_lines.append(joined_word)
-                fix_count += 1
-                i += 2
-                continue
-
-        # Otherwise keep the line as‑is
-        fixed_lines.append(line)
-        i += 1
-
-    # Re‑assemble the processed lines into a single string
-    result = " ".join(fixed_lines)
-    return result, fix_count
 
 
 class PostProcessor:

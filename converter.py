@@ -13,7 +13,8 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass   # Makes ConversionConfig & ConversionStats dataclasses
 from enum import Enum               # Defines ConversionMode enum
 from pathlib import Path            # Path objects for filesystem paths
-from typing import (Any, Callable, Dict, List, Optional, Tuple)  # Generic type hints
+from typing import (Any, Callable, Dict, List, NamedTuple, Optional, Tuple)  # Generic type hints
+
 
 
 # ------------------------------------------------------------
@@ -36,7 +37,12 @@ from overlap import (
     calculate_bbox_distance,
     check_margin_violation,
 )
-from post_process import count_characters, count_words, fix_hyphenated_lines
+from post_process import (
+    count_characters,
+    count_words,
+    fix_hyphenated_lines,
+    remove_nonprintable_chars,
+)
 from tables import TableData, TableProcessor
 #   –‑ Table cleaning, structuring and JSON‑serialization helpers
 
@@ -87,6 +93,8 @@ class ConversionConfig:
     formula_render_scale: float = 2.0
     formula_padding: float = 5.0
     formula_cluster_merge_tolerance: float = 5.0
+    
+    preserve_layout: bool = False
 
 
 @dataclass
@@ -271,16 +279,6 @@ def assemble_results(
     metadata: Optional[Dict[str, Any]] = None,
     config: Optional[ConversionConfig] = None,
 ) -> Dict[str, Any]:
-    """Collect page results, write them to the output file, and return aggregated stats.
-
-    The function:
-
-    1. Sorts results by page number to preserve document order.
-    2. Extracts per‑page statistics and aggregates them into a global dict.
-    3. Writes a human‑readable header (PDF name, media folder, config status) followed by the
-       page contents.
-    The aggregated stats are returned for later merging.
-    """
     sorted_results = sorted(results, key=lambda x: x[0])
 
     total_stats = {
@@ -294,11 +292,14 @@ def assemble_results(
         "char_count": 0,
         "formulas_saved": 0,
         "errors": 0,
+        "pages_failed": 0,
     }
 
     for _, _, page_stats in sorted_results:
         if "error" in page_stats:
-            total_stats["errors"] += page_stats.get("pages_failed", 1)
+            failed_pages = int(page_stats.get("pages_failed", 1))
+            total_stats["errors"] += failed_pages
+            total_stats["pages_failed"] += failed_pages
         else:
             total_stats["pages_processed"] += page_stats.get("pages_processed", 1)
             total_stats["images_saved"] += page_stats.get("images_saved", 0)
@@ -313,7 +314,7 @@ def assemble_results(
     with open(output_file, "w", encoding="utf-8") as output:
         output.write(f"PDF: {pdf_filename}\n")
         output.write(f"Media Directory: {os.path.basename(media_dir)}\n")
-        
+
         # --- Configuration Status ---
         if config is not None:
             output.write(f"Hyphen Fix: {'enabled' if config.hyphen_fix_enabled else 'disabled'}\n")
@@ -324,19 +325,20 @@ def assemble_results(
 
         output.write(f"Word Count: {total_stats['word_count']}\n")
         output.write(f"Character Count: {total_stats['char_count']}\n")
-        
+        output.write(f"Failed Pages: {total_stats['pages_failed']}\n")
+
         # --- Conditional counts: only shown when the feature is enabled ---
         if config is None or config.save_formulas:
             output.write(f"Formulas Saved: {total_stats['formulas_saved']}\n")
         if config is None or config.save_images:
             output.write(f"Images Saved: {total_stats['images_saved']}\n")
         if config is None or config.save_drawings:
-            output.write(f"Drawings Saved: {total_stats['drawings_saved']}\n")            
+            output.write(f"Drawings Saved: {total_stats['drawings_saved']}\n")
         if config is None or config.hyphen_fix_enabled:
             output.write(f"Text Hyphens Fixed: {total_stats['hyphens_fixed']}\n")
             output.write(f"Table Hyphens Fixed: {total_stats['table_hyphens_fixed']}\n")
         # ------------------------------------------------------------------
-        
+
         output.write("=" * 60 + "\n\n")
 
         cleaned_metadata = _clean_pdf_metadata(metadata)
@@ -353,9 +355,117 @@ def assemble_results(
     return total_stats
 
 
+
 # ----------------------------------------------------------------------
 # PDF validation
 # ----------------------------------------------------------------------
+
+
+# ----------------------------------------------------------------------
+# PDF Convertibility Check
+# ----------------------------------------------------------------------
+
+class PDFCheckResult(NamedTuple):
+    """Results of the PDF convertibility check."""
+    low_printable_ratio: bool      # True if avg printable ratio < 80%
+    high_replacement_chars: bool   # True if avg replacement chars > 20
+    high_strange_control_chars: bool  # True if avg strange control chars > 200
+
+    @property
+    def is_convertible(self) -> bool:
+        """True if the PDF is likely convertible to plain text."""
+        return not (
+            self.low_printable_ratio
+            or self.high_replacement_chars
+            or self.high_strange_control_chars
+        )
+
+
+def check_pdf_convertibility(
+    pdf_path: str,
+    max_pages: int = 10,
+) -> PDFCheckResult:
+    """
+    Check whether a PDF is likely convertible to plain text.
+
+    Analyzes the first `max_pages` pages and flags the PDF as non-convertible
+    if any of these conditions are met:
+      - Average printable character ratio < 80%
+      - Average replacement characters (U+FFFD) > 20 per page
+      - Average strange control characters > 200 per page
+
+    Args:
+        pdf_path: Path to the PDF file.
+        max_pages: Maximum number of pages to analyze.
+
+    Returns:
+        PDFCheckResult with three boolean flags and an `is_convertible` property.
+    """
+    try:
+        doc = pymupdf.open(pdf_path)
+    except Exception:
+        # If we can't even open it, it's definitely not convertible
+        return PDFCheckResult(True, True, True)
+
+    total_printable_ratio = 0.0
+    total_replacement_chars = 0
+    total_strange_control_chars = 0
+    pages_checked = 0
+
+    for page_number, page in enumerate(doc, start=1):
+        if page_number > max_pages:
+            break
+
+        try:
+            text = page.get_text("text")
+        except Exception:
+            # If a specific page fails to extract text, treat it as non-printable
+            text = ""
+
+        if not text:
+            printable_ratio = 0.0
+        else:
+            printable_chars = sum(
+                1 for char in text if char.isprintable() or char in "\n\r\t"
+            )
+            printable_ratio = printable_chars / len(text)
+
+        replacement_chars = text.count("\ufffd")
+
+        strange_control_chars = sum(
+            1
+            for char in text
+            if ord(char) < 32 and char not in "\n\r\t"
+        )
+
+        total_printable_ratio += printable_ratio
+        total_replacement_chars += replacement_chars
+        total_strange_control_chars += strange_control_chars
+        pages_checked += 1
+
+    doc.close()
+
+    if pages_checked == 0:
+        # No pages to analyze; treat as non-convertible
+        return PDFCheckResult(
+            low_printable_ratio=True,
+            high_replacement_chars=False,
+            high_strange_control_chars=False,
+        )
+
+    average_printable_ratio = total_printable_ratio / pages_checked
+    average_replacement_chars = total_replacement_chars / pages_checked
+    average_strange_control_chars = total_strange_control_chars / pages_checked
+
+    return PDFCheckResult(
+        low_printable_ratio=average_printable_ratio < 0.80,
+        high_replacement_chars=average_replacement_chars > 20,
+        high_strange_control_chars=average_strange_control_chars > 200,
+    )
+
+
+
+
 class PDFValidator:
     """Validate PDF files before they are processed."""
 
@@ -407,6 +517,21 @@ class PDFValidator:
 
             if warnings:
                 print(f"Warning for '{filename}': {warnings}")
+
+            # --- NEW: Check Convertibility ---
+            check_result = check_pdf_convertibility(pdf_path, max_pages=10)
+            if not check_result.is_convertible:
+                result["valid"] = False
+                reasons = []
+                if check_result.low_printable_ratio:
+                    reasons.append("Low printable character ratio")
+                if check_result.high_replacement_chars:
+                    reasons.append("High number of replacement characters (U+FFFD)")
+                if check_result.high_strange_control_chars:
+                    reasons.append("High number of strange control characters")
+                
+                result["reason"] = "Likely non-convertible to text: " + ", ".join(reasons)
+            # -------------------------------
 
             doc.close()
         except pymupdf.FileDataError as exc:
@@ -603,6 +728,18 @@ class PageProcessor:
     # ----------------------------------------------------------------------
     # Helper methods used by ``process`` – each is documented inline
     # ----------------------------------------------------------------------
+
+
+    @property
+    def _effective_hyphen_fix_enabled(self) -> bool:
+        """Return whether hyphen fixing should actually run.
+
+        ``preserve_layout`` takes priority over ``hyphen_fix_enabled`` because
+        preserving line breaks means we must not join hyphenated lines.
+        """
+        return self.config.hyphen_fix_enabled and not self.config.preserve_layout
+
+
     def _resolve_image_drawing_conflicts(
         self,
         images_on_page: List[ImageInfo],
@@ -692,9 +829,10 @@ class PageProcessor:
             # Build the final logical matrix from bbox geometry, then clean it.
             cleaned_data, table_fix_count = TableProcessor.prepare_table_data(
                 raw_table,
-                hyphen_fix_enabled=self.config.hyphen_fix_enabled,
+                hyphen_fix_enabled=self._effective_hyphen_fix_enabled,
                 return_fix_count=True,
             )
+
             table_bbox = BoundingBox.from_tuple(table.bbox).to_tuple()
 
             # ---- Margin check -------------------------------------------------
@@ -897,19 +1035,18 @@ class PageProcessor:
             if should_skip:
                 continue
 
-            text = text.replace("\u00ad", "")  # SOFT HYPHEN
-            text = text.replace("\u200b", "")  # Remove zero-width space
-            text = text.replace("\u2009", " ")  # Normalize thin space to space
-            text = text.replace("\u00a0", " ")  # NBSP
-            text = text.replace("\u2002", " ")  # EN SPACE
-            text = text.replace("\u200a", " ")  # HAIR SPACE
-
-            if self.config.hyphen_fix_enabled:
+ 
+            if self._effective_hyphen_fix_enabled:
                 fixed_text, fix_count = fix_hyphenated_lines(text)
             else:
                 fixed_text, fix_count = text, 0
 
-            fixed_text = fixed_text.strip()
+            fixed_text = remove_nonprintable_chars(
+                fixed_text,
+                preserve_line_breaks=self.config.preserve_layout,
+            )
+
+
             if not fixed_text:
                 continue
 
@@ -939,21 +1076,21 @@ class PageProcessor:
             clip = pymupdf.Rect(drawing_bbox)
             raw_text = page.get_text("text", clip=clip)
 
-            raw_text = raw_text.replace("\u00ad", "")
-            raw_text = raw_text.replace("\u200b", "")
-            raw_text = raw_text.replace("\u2009", " ")
-            raw_text = raw_text.replace("\u00a0", " ")
-            raw_text = raw_text.replace("\u2002", " ")
-            raw_text = raw_text.replace("\u200a", " ")
 
-            if self.config.hyphen_fix_enabled:
+            if self._effective_hyphen_fix_enabled:
                 fixed_text, fix_count = fix_hyphenated_lines(raw_text)
             else:
                 fixed_text, fix_count = raw_text, 0
 
-            fixed_text = fixed_text.strip()
+            fixed_text = remove_nonprintable_chars(
+                fixed_text,
+                preserve_line_breaks=self.config.preserve_layout,
+            )
+
+
             if fixed_text:
                 content.append((drawing_bbox, fixed_text, fix_count))
+
 
         # Drawings are emitted as whole blocks, ordered by page position.
         content.sort(key=lambda item: (item[0][1], item[0][0]))
@@ -1017,141 +1154,284 @@ class PageProcessor:
         blocks: List[Tuple],
         page: Optional[pymupdf.Page] = None,
     ) -> List[Tuple]:
-        """Sort text blocks into reading order while respecting column and row structure.
+        """Sort text blocks into a robust reading order.
 
-        The algorithm:
+        The new strategy is hierarchical:
 
-        1. Discard blocks smaller than ``min_block_size_px``.
-        2. If only one block remains, return it.
-        3. Otherwise, detect column boundaries using ``col_tolerance`` (as a
-           fraction of page width).
-        4. Within each column, group blocks into rows using ``row_tolerance``
-           (as a fraction of page height) and sort left‑to‑right inside each row.
-        5. Append any non‑column blocks in Y order.
+        1. Filter tiny blocks.
+        2. Split the remaining blocks into vertical layout groups.
+        3. Inside each group:
+           - emit leading heading-like blocks first,
+           - then split the remaining body text into columns,
+           - order columns left-to-right by X position,
+           - read each column top-to-bottom.
+
+        This handles layouts such as:
+
+            Heading A
+            [Left Column]   [Right Column]
+
+            Heading B
+            [Left Column]   [Right Column]
         """
-        if not blocks or len(blocks) < 2:
-            return [
-                block
-                for block in blocks
-                if passes_size_filter(BoundingBox.from_tuple(block[:4]), self.config.min_block_size_px)
-            ]
+        if not blocks:
+            return []
 
-        # ---- Size filter ----------------------------------------------------
+        page_width = (
+            page.rect.width
+            if page is not None
+            else max((block[2] - block[0]) for block in blocks)
+        )
+        page_height = (
+            page.rect.height
+            if page is not None
+            else max((block[3] - block[1]) for block in blocks)
+        )
+
         filtered_blocks = [
             block
             for block in blocks
-            if passes_size_filter(BoundingBox.from_tuple(block[:4]), self.config.min_block_size_px)
+            if passes_size_filter(
+                BoundingBox.from_tuple(block[:4]),
+                self.config.min_block_size_px,
+            )
         ]
+
         if not filtered_blocks:
             return []
 
-        # ---- Column detection -----------------------------------------------
-        blocks_by_x = sorted(filtered_blocks, key=lambda b: b[0])
-        columns = self._detect_columns(blocks_by_x, page.rect.width if page is not None else 0.0)
+        layout_groups = self._split_into_layout_groups(filtered_blocks, page_width, page_height)
 
-        # ---- Re‑assemble final order -----------------------------------------
-        page_height = page.rect.height if page is not None else 0.0
-        row_threshold = self.config.row_tolerance * page_height
+        ordered_blocks: List[Tuple] = []
 
-        sorted_columns: List[List[Tuple]] = []
-        all_column_block_indices = set()
-        for column in columns:
-            # Sort by top edge, then group into rows using row_tolerance.
-            column_by_y = sorted(column, key=lambda b: b[1])
-            rows: List[List[Tuple]] = []
-            current_row: List[Tuple] = [column_by_y[0]]
-            for block in column_by_y[1:]:
-                if row_threshold > 0 and abs(block[1] - current_row[-1][1]) <= row_threshold:
-                    current_row.append(block)
-                else:
-                    rows.append(sorted(current_row, key=lambda b: b[0]))
-                    current_row = [block]
-            rows.append(sorted(current_row, key=lambda b: b[0]))
+        for group in layout_groups:
+            heading_blocks, body_blocks = self._separate_headings_in_group(
+                group,
+                page_width,
+                page_height,
+            )
 
-            for row in rows:
-                for block in row:
-                    all_column_block_indices.add(id(block))
-            sorted_columns.extend(rows)
+            # Headings first inside this vertical group.
+            ordered_blocks.extend(self._sort_reading_stream(heading_blocks, page_height))
 
-        # Blocks that do not belong to any detected column keep their original Y order
-        non_column_blocks = [b for b in filtered_blocks if id(b) not in all_column_block_indices]
-        non_column_blocks.sort(key=lambda b: b[1])
-
-        sorted_blocks = []
-        sorted_blocks.extend(non_column_blocks)
-        for row in sorted_columns:
-            sorted_blocks.extend(row)
-        return sorted_blocks
-    
-
-# In converter.py
-
-    def _detect_columns(
-        self,
-        blocks_by_x: List[Tuple],
-        page_width: float,
-    ) -> List[List[Tuple]]:
-        """Group blocks that belong to the same vertical column.
-
-        Two blocks are considered part of the same column if:
-        1. Their center X coordinates differ by at most ``col_tolerance * page_width``, OR
-        2. Their horizontal bounding boxes overlap by more than 50% of their smaller width.
-
-        This is more robust than comparing only left edges, as it handles indented
-        text, centered paragraphs, and justified text better.
-        """
-        if not blocks_by_x:
-            return []
-
-        # Pre-compute center X for each block to avoid repeated calculation
-        # blocks_by_x items are tuples: (x0, y0, x1, y1, text, ...)
-        block_centers = [(block[0] + block[2]) / 2.0 for block in blocks_by_x]
-        
-        columns: List[List[Tuple]] = []
-        used_block_indices: set[int] = set()
-
-        # Sort by center X to make column detection more stable
-        sorted_indices = sorted(range(len(blocks_by_x)), key=lambda i: block_centers[i])
-
-        for i_idx, i in enumerate(sorted_indices):
-            if i in used_block_indices:
+            if not body_blocks:
                 continue
 
-            current_col = [blocks_by_x[i]]
-            used_block_indices.add(i)
-            center_i = block_centers[i]
-            
-            # Check against all other blocks to find those in the same column
-            for j_idx, j in enumerate(sorted_indices):
-                if j == i or j in used_block_indices:
+            # Body text is processed as one or more columns.
+            column_groups = self._group_columns_by_x(body_blocks, page_width)
+            column_groups.sort(key=lambda col: min(block[0] for block in col))
+
+            for column in column_groups:
+                ordered_blocks.extend(self._sort_reading_stream(column, page_height))
+
+        return ordered_blocks
+
+
+    def _split_into_layout_groups(
+        self,
+        blocks: List[Tuple],
+        page_width: float,
+        page_height: float,
+    ) -> List[List[Tuple]]:
+        """Split blocks into vertical layout groups.
+
+        A new group starts when either:
+          - there is a large vertical gap between content blocks, or
+          - a heading-like block appears after the current group already contains body text.
+
+        This allows repeated structures like:
+            Heading 1 -> columns
+            Heading 2 -> columns
+        """
+        if not blocks:
+            return []
+
+        sorted_blocks = sorted(blocks, key=lambda b: (b[1], b[0]))
+
+        min_section_gap = max(8.0, page_height * 0.02)
+        heading_gap = max(6.0, self.config.min_block_size_px)
+
+        groups: List[List[Tuple]] = []
+        current_group: List[Tuple] = [sorted_blocks[0]]
+        current_bottom = sorted_blocks[0][3]
+        has_body_content_in_current_group = False
+
+        for block in sorted_blocks[1:]:
+            y0, y1 = block[1], block[3]
+
+            gap_before_block = y0 - current_bottom
+
+            is_large_gap = gap_before_block >= min_section_gap
+
+            # A heading-like block should start a new group only if the current
+            # group already contains some body content below/after it.
+            starts_new_group_after_body = (
+                has_body_content_in_current_group
+                and self._is_heading_like(block, page_width)
+                and gap_before_block >= heading_gap
+            )
+
+            if is_large_gap or starts_new_group_after_body:
+                groups.append(current_group)
+                current_group = [block]
+                current_bottom = y1
+                has_body_content_in_current_group = False
+            else:
+                current_group.append(block)
+                current_bottom = max(current_bottom, y1)
+
+                # If this block looks like body text rather than a heading,
+                # mark the group as containing body content.
+                if not self._is_heading_like(block, page_width):
+                    has_body_content_in_current_group = True
+
+        groups.append(current_group)
+        return groups
+
+
+    def _separate_headings_in_group(
+        self,
+        group_blocks: List[Tuple],
+        page_width: float,
+        page_height: float,
+    ) -> Tuple[List[Tuple], List[Tuple]]:
+        """Separate leading heading-like blocks from body text inside one group."""
+        if not group_blocks:
+            return [], []
+
+        sorted_by_y = sorted(group_blocks, key=lambda b: (b[1], b[0]))
+
+        headings: List[Tuple] = []
+        body: List[Tuple] = []
+
+        # Only the first few blocks at the top of a group are allowed to be headings.
+        # This avoids misclassifying ordinary paragraph text later in the column.
+        candidate_limit = min(3, len(sorted_by_y))
+        max_heading_height = max(30.0, self.config.min_block_size_px * 4)
+
+        for block in sorted_by_y[:candidate_limit]:
+            x0, y0, x1, y1 = block[:4]
+            width = x1 - x0
+            height = max(1e-6, y1 - y0)
+
+            is_wide_enough = width >= 0.5 * page_width
+            is_short_enough = height <= max_heading_height
+
+            if is_wide_enough and is_short_enough:
+                headings.append(block)
+            else:
+                body.append(block)
+
+        # Everything after the candidate heading zone belongs to the body.
+        rest = sorted_by_y[candidate_limit:]
+        return headings, body + rest
+
+    def _group_columns_by_x(
+        self,
+        blocks: List[Tuple],
+        page_width: float,
+    ) -> List[List[Tuple]]:
+        """Group body text blocks into columns using horizontal position.
+
+        This is intentionally per-group, not whole-page, so repeated sections
+        such as two stacked heading+column pairs are handled correctly.
+        """
+        if not blocks:
+            return []
+
+        if len(blocks) == 1:
+            return [blocks]
+
+        centers = [(block[0] + block[2]) / 2.0 for block in blocks]
+        order = sorted(range(len(blocks)), key=lambda i: centers[i])
+
+        columns: List[List[Tuple]] = []
+        used = set()
+
+        x_tolerance = max(8.0, page_width * self.config.col_tolerance)
+
+        for start_index in order:
+            if start_index in used:
+                continue
+
+            current_column = [blocks[start_index]]
+            used.add(start_index)
+            center_i = centers[start_index]
+
+            for other_index in order:
+                if other_index == start_index or other_index in used:
                     continue
-                
-                center_j = block_centers[j]
-                
-                # Criterion 1: Center X alignment within tolerance
-                col_threshold = self.config.col_tolerance * page_width
-                centers_close = abs(center_i - center_j) <= col_threshold
-                
-                # Criterion 2: Significant horizontal overlap (fallback for indented/justified text)
-                # Calculate horizontal overlap percentage relative to the smaller width
-                i_x0, _, i_x1, _ = blocks_by_x[i][:4]
-                j_x0, _, j_x1, _ = blocks_by_x[j][:4]
-                
-                min_width = max(1e-6, min(i_x1 - i_x0, j_x1 - j_x0)) # Avoid division by zero
+
+                center_j = centers[other_index]
+
+                # Criterion 1: similar horizontal position.
+                same_center_x = abs(center_i - center_j) <= x_tolerance
+
+                # Criterion 2: significant horizontal overlap.
+                i_x0, _, i_x1, _ = blocks[start_index][:4]
+                j_x0, _, j_x1, _ = blocks[other_index][:4]
+
+                min_width = max(1e-6, min(i_x1 - i_x0, j_x1 - j_x0))
                 overlap_start = max(i_x0, j_x0)
                 overlap_end = min(i_x1, j_x1)
                 overlap_width = max(0.0, overlap_end - overlap_start)
-                
                 overlap_ratio = overlap_width / min_width
-                overlaps_significantly = overlap_ratio > 0.7
 
-                if centers_close or overlaps_significantly:
-                    current_col.append(blocks_by_x[j])
-                    used_block_indices.add(j)
+                if same_center_x or overlap_ratio > 0.5:
+                    current_column.append(blocks[other_index])
+                    used.add(other_index)
 
-            columns.append(current_col)
+            columns.append(current_column)
 
         return columns
+
+
+    def _sort_reading_stream(
+        self,
+        blocks: List[Tuple],
+        page_height: float,
+    ) -> List[Tuple]:
+        """Sort one reading stream top-to-bottom with left-to-right row tie-breaking."""
+        if len(blocks) <= 1:
+            return list(blocks)
+
+        sorted_blocks = sorted(blocks, key=lambda b: (b[1], b[0]))
+
+        result: List[Tuple] = []
+        i = 0
+        n = len(sorted_blocks)
+
+        row_threshold = max(4.0, self.config.row_tolerance * page_height)
+
+        while i < n:
+            current_row = [sorted_blocks[i]]
+            i += 1
+
+            # Group vertically close blocks into the same visual line/row.
+            while i < n and abs(sorted_blocks[i][1] - current_row[-1][1]) <= row_threshold:
+                current_row.append(sorted_blocks[i])
+                i += 1
+
+            # Inside one visual row, read left-to-right.
+            result.extend(sorted(current_row, key=lambda b: (b[0], b[1])))
+
+        return result
+
+
+    def _is_heading_like(self, block: Tuple, page_width: float) -> bool:
+        """Return True if a block looks like a heading or section title."""
+        x0, y0, x1, y1 = block[:4]
+        width = max(0.0, x1 - x0)
+        height = max(0.0, y1 - y0)
+
+        # Heading-like blocks are usually:
+        # - horizontally wide compared with the page, and
+        # - vertically short compared with normal paragraph blocks.
+        if width < 0.45 * page_width:
+            return False
+
+        max_heading_height = max(30.0, self.config.min_block_size_px * 4)
+        return height <= max_heading_height
 
 
     # ----------------------------------------------------------------------
@@ -1423,6 +1703,7 @@ class PDFConverter:
             "char_count": 0,
             "formulas_saved": 0,
             "errors": 0,
+            "pages_failed": 0,
         }
 
     def _run_tasks(
@@ -1516,9 +1797,12 @@ class PDFConverter:
                                 drawings_saved=dws_by_file[filename],
                                 formulas_saved=formulas_by_file[filename],
                             )
+
                 except Exception as exc:
+                    failed_pages = task_info.get("expected_pages", 1)
                     print(f"Error processing chunk {task_info['page_range']}: {exc}")
-                    global_stats["errors"] += task_info.get("expected_pages", 1)
+                    global_stats["errors"] += failed_pages
+                    global_stats["pages_failed"] += failed_pages
 
         return results_by_file
 
@@ -1534,6 +1818,7 @@ class PDFConverter:
         global_stats["char_count"] += file_stats["char_count"]
         global_stats["formulas_saved"] += file_stats["formulas_saved"]
         global_stats["errors"] += file_stats["errors"]
+        global_stats["pages_failed"] += file_stats.get("pages_failed", 0)
 
     def _clear_media_folders(
         self,
@@ -1559,10 +1844,12 @@ class PDFConverter:
 def build_default_config(
     no_images: bool = False,
     no_drawings: bool = False,
-    no_hyphen_fix: bool = False,
+    no_hyphen_fix: bool = True,
     include_metadata: bool = True,
     no_formulas: bool = False,
+    preserve_layout: bool = False,
 ) -> ConversionConfig:
+
     """Create a sensible default ``ConversionConfig`` for command‑line use.
 
     Parameters
@@ -1588,7 +1875,9 @@ def build_default_config(
         enable_margin_check=True,
         hyphen_fix_enabled=not no_hyphen_fix,
         include_metadata=include_metadata,
+        preserve_layout=preserve_layout,
     )
+
 
 
 def run_full_conversion(

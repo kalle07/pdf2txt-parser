@@ -472,6 +472,7 @@ class PDFParserFrame(wx.Frame):
         self._per_file_images: Dict[str, int] = {}
         self._per_file_drawings: Dict[str, int] = {}
         self._per_file_formulas: Dict[str, int] = {}
+        self._per_file_failed_pages: Dict[str, int] = {}
 
         # running sums updated as scanning completes
         self._total_pages_all: int = 0
@@ -490,6 +491,7 @@ class PDFParserFrame(wx.Frame):
             6: True,   # Formulas: high-low
         }
         self._sort_column: Optional[int] = None
+        self._user_sorted: bool = False
 
         self._build_ui()
         self._build_context_menu()
@@ -670,8 +672,16 @@ class PDFParserFrame(wx.Frame):
         self._config_panel.SetBackgroundColour(t.get("border_grey", t["panel_bg"]))
         for lbl in (self._lbl_cores, self._lbl_min_size, self._lbl_max_items):
             lbl.SetForegroundColour(t["text"])
-        for chk in (self.chk_images, self.chk_drawings, self.chk_formulas, self.chk_margin,
-                     self.chk_hyphen, self.chk_metadata, self.chk_post_only):
+        for chk in (
+            self.chk_images,
+            self.chk_drawings,
+            self.chk_formulas,
+            self.chk_margin,
+            self.chk_hyphen,
+            self.chk_metadata,
+            self.chk_preserve_layout,
+            self.chk_post_only,
+        ):
             chk.SetForegroundColour(t["text"])
             chk.SetBackgroundColour(t["panel_bg"])
         for sp in (self.spin_cores, self.spin_min_size, self.spin_max_items):
@@ -680,8 +690,16 @@ class PDFParserFrame(wx.Frame):
 
         # status panel
         self._status_panel.SetBackgroundColour(status_bg)
-        for lbl in (self.lbl_pdf_left, self.lbl_pages_left, self.lbl_pps,
-                     self.lbl_eta, self.lbl_images, self.lbl_drawings, self.lbl_formulas):
+        for lbl in (
+            self.lbl_pdf_left,
+            self.lbl_pages_left,
+            self.lbl_pps,
+            self.lbl_eta,
+            self.lbl_images,
+            self.lbl_drawings,
+            self.lbl_formulas,
+            self.lbl_failed_pages,
+        ):
             lbl.SetForegroundColour(t["text"])
 
         # text viewer
@@ -830,8 +848,12 @@ class PDFParserFrame(wx.Frame):
         if column == 2:
             return
 
-        if column not in (0, 1, 3, 4, 5):
+        # Allow sorting by File, Pages, Status, Images, Drawings, Formulas.
+        if column not in (0, 1, 3, 4, 5, 6):
             return
+
+        # From this moment on, the user controls the list order.
+        self._user_sorted = True
 
         # Clicking the same column reverses the direction.
         # Clicking another column uses its configured initial direction.
@@ -843,6 +865,7 @@ class PDFParserFrame(wx.Frame):
             self._sort_column = column
 
         self._sort_file_list(column, descending)
+
 
     def _sort_file_list(self, column: int, descending: bool) -> None:
         """Sort FileInfo objects and rebuild the ListCtrl rows."""
@@ -864,11 +887,12 @@ class PDFParserFrame(wx.Frame):
             # Ready -> Processing -> Done
             # Error/Scanning are placed after the normal states.
             status_order = {
-                "Ready": 0,
-                "Processing": 1,
+                "Error": 0,
+                "Few Chars": 1,
                 "Done": 2,
-                "Error": 3,
-                "Scanning...": 4,
+                "Ready": 3,
+                "Processing": 4,
+                "Scanning...": 5,
             }
             key_func = lambda fi: status_order.get(fi.status, 99)
 
@@ -933,6 +957,11 @@ class PDFParserFrame(wx.Frame):
                     status_text = fi.status
                     colour = self.C_DONE
 
+                elif fi.status == "Few Chars":
+                    progress = f"0 / {fi.pages}"
+                    status_text = fi.status
+                    colour = self.C_FEW_CHARS
+
                 else:
                     progress = "…"
                     status_text = fi.status
@@ -956,6 +985,15 @@ class PDFParserFrame(wx.Frame):
             self.file_list.Thaw()
 
         self._refresh_file_paths()
+
+
+    def _apply_default_status_order(self) -> None:
+        """Apply the default status order unless the user has sorted manually."""
+        if self._user_sorted:
+            return
+
+        self._sort_file_list(3, False)
+
 
     def _file_list_number(self, fi: FileInfo, column: int) -> int:
         """Return numeric value used for media sorting."""
@@ -1269,7 +1307,7 @@ class PDFParserFrame(wx.Frame):
         self.chk_formulas = wx.CheckBox(panel, label="Save formulas")
         self.chk_formulas.SetValue(False)
         self.chk_formulas.SetToolTip(
-            "Extract the Cambria Maths font/formula if the PDF file was saved from an Office .docx document."
+            "Extract the Cambria Maths font/formula if the PDF file was saved from an MS Office document."
         )
 
         self.chk_margin = wx.CheckBox(panel, label="Enable margin check")
@@ -1298,6 +1336,13 @@ class PDFParserFrame(wx.Frame):
             "Include PDF metadata such as title, author and document information."
         )
 
+        self.chk_preserve_layout = wx.CheckBox(panel, label="Preserve layout")
+        self.chk_preserve_layout.SetValue(False)
+        self.chk_preserve_layout.SetToolTip(
+            "Not recommended: Disable hyphen joining and preserve all line breaks instead of "
+            "replacing them with whitespace. Its only Visual."
+        )
+
         self.chk_post_only = wx.CheckBox(
             panel,
             label="Post-process only (no PDF)",
@@ -1314,6 +1359,7 @@ class PDFParserFrame(wx.Frame):
         for chk in (
             self.chk_hyphen,
             self.chk_metadata,
+            self.chk_preserve_layout,
             self.chk_post_only,
         ):
             cb_row2.Add(chk, 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 2)
@@ -1444,7 +1490,13 @@ class PDFParserFrame(wx.Frame):
         self.lbl_images = wx.StaticText(panel, label="Images saved: 0")
         self.lbl_drawings = wx.StaticText(panel, label="Drawings saved: 0")
         self.lbl_formulas = wx.StaticText(panel, label="Formulas saved: 0")
-        for lbl in (self.lbl_images, self.lbl_drawings, self.lbl_formulas):
+        self.lbl_failed_pages = wx.StaticText(panel, label="Failed pages: 0")
+        for lbl in (
+            self.lbl_images,
+            self.lbl_drawings,
+            self.lbl_formulas,
+            self.lbl_failed_pages,
+        ):
             info_row2.Add(lbl, 1, wx.ALL | wx.ALIGN_CENTER, 2)
         sizer.Add(info_row2, 0, wx.EXPAND)
 
@@ -1588,8 +1640,22 @@ class PDFParserFrame(wx.Frame):
         self._remove_selected_rows()
 
     def _on_clear(self, _evt: wx.CommandEvent) -> None:
+        if self.file_list.GetItemCount() == 0:
+            return
+
+        answer = wx.MessageBox(
+            "Remove all PDFs from the list?",
+            "Remove All",
+            wx.YES_NO | wx.ICON_QUESTION,
+        )
+
+        if answer != wx.YES:
+            return
+
         self.file_list.DeleteAllItems()
         self.file_info.clear()
+        self.txt_viewer.Clear()
+
 
     def _on_list_right_click(self, evt: wx.ListEvent) -> None:
         # wx.ListEvent uses GetIndex(), not m_itemIndex (Qt convention)
@@ -1650,17 +1716,26 @@ class PDFParserFrame(wx.Frame):
             os.startfile(fi.path)
 
     def _on_list_select(self, evt: wx.ListEvent) -> None:
-        """Load the converted .txt for the selected PDF (if done)."""
         idx = evt.GetIndex()
         fi = self.file_info.get(idx)
         if not fi:
             return
 
-        # gui_example pattern: os.path.splitext + errors="ignore"
         txt_path = os.path.splitext(fi.path)[0] + ".txt"
         self.txt_viewer.Clear()
 
-        # Show validation info for invalid/protected files
+        if os.path.exists(txt_path):
+            with open(txt_path, "r", encoding="utf-8", errors="ignore") as f:
+                text = f.read()
+
+            text = "".join(
+                ch if ch in "\n\r\t" or ord(ch) >= 32 else " "
+                for ch in text
+            )
+
+            self.txt_viewer.SetValue(text)
+            return
+
         if fi.status == "Error":
             result = PDFValidator.validate_file(fi.path)
             lines = [
@@ -1674,12 +1749,10 @@ class PDFParserFrame(wx.Frame):
             self.txt_viewer.SetValue("\n".join(lines))
             return
 
-        if fi.status != "Done" or not os.path.exists(txt_path):
-            self.txt_viewer.SetValue(f"({fi.name}) not converted yet")
-            return
+        self.txt_viewer.SetValue(f"({fi.name}) not converted yet")
 
-        with open(txt_path, "r", encoding="utf-8", errors="ignore") as f:
-            self.txt_viewer.SetValue(f.read())
+
+
 
     # ---- scan callback ----
     def _on_scan_result(self, path: str, valid: bool, pages: int, reason: str) -> None:
@@ -1728,6 +1801,8 @@ class PDFParserFrame(wx.Frame):
         self._total_pages_all = sum(fi.pages for fi in self.file_info.values())
         self.lbl_pdf_left.SetLabel(f"PDFs left: {self._total_files_all}")
         self.lbl_pages_left.SetLabel(f"Pages left: {self._total_pages_all}")
+        # Keep the default order unless the user has manually sorted.
+        self._apply_default_status_order()
 
     # ==================================================================== #
     #  Conversion
@@ -1768,7 +1843,9 @@ class PDFParserFrame(wx.Frame):
             include_metadata=self.chk_metadata.GetValue(),
             min_size_px=self.spin_min_size.GetValue(),
             max_items_per_page=self.spin_max_items.GetValue(),
+            preserve_layout=self.chk_preserve_layout.GetValue(),
         )
+
 
         # compute totals for progress
         self._total_pages = sum(fi.pages for fi in self.file_info.values() if fi.status in ("Ready", "Done"))
@@ -1782,6 +1859,7 @@ class PDFParserFrame(wx.Frame):
         self._per_file_images.clear()
         self._per_file_drawings.clear()
         self._per_file_formulas.clear()
+        self._per_file_failed_pages.clear()
         self._start_time = time.time()
         self._is_processing = True
 
@@ -2067,8 +2145,9 @@ class PDFParserFrame(wx.Frame):
                 fi.status = "Done"
                 # 0 left / pages converted
                 self.file_list.SetItem(idx, 2, f"0 / {fi.pages}")
-                self.file_list.SetItem(idx, 3, fi.status)
                 self.file_list.SetItemTextColour(idx, self.C_DONE)
+
+            failed_pages = 0
 
             # write final images / drawings / formulas for this file
             if fi.name in per_file:
@@ -2077,23 +2156,40 @@ class PDFParserFrame(wx.Frame):
                 self.file_list.SetItem(idx, 5, str(fs.get("drawings_saved", 0)))
                 self.file_list.SetItem(idx, 6, str(fs.get("formulas_saved", 0)))
 
+                failed_pages = int(fs.get("pages_failed", 0))
+                self._per_file_failed_pages[fi.name] = failed_pages
+
                 # --- New Logic: Check Character Density ---
                 char_count = fs.get("char_count", 0)
                 pages_processed = fs.get("pages_processed", 0)
-                
+
                 if pages_processed > 0:
                     avg_chars = char_count / pages_processed
                     if avg_chars < 100:
                         fi.status = "Few Chars"
-                        self.file_list.SetItem(idx, 3, fi.status)
                         self.file_list.SetItemTextColour(idx, self.C_FEW_CHARS)
                         low_char_files.append((fi.name, avg_chars))
                 # -------------------------------------------
+
+            # If every page failed, treat the file as an error.
+            if fi.pages > 0 and failed_pages >= fi.pages:
+                fi.status = "Error"
+                self.file_list.SetItemTextColour(idx, self.C_ERROR)
+
+            # Display failed pages in the Status column.
+            status_text = fi.status
+            if failed_pages > 0:
+                status_text = f"{fi.status} ({failed_pages} failed)"
+
+            self.file_list.SetItem(idx, 3, status_text)
 
         # Log messages for low character density files
         if low_char_files:
             for name, avg in low_char_files:
                 self._log(f"Warning: '{name}' has low text density ({avg:.1f} chars/page).")
+
+        total_failed_pages = sum(self._per_file_failed_pages.values())
+        self.lbl_failed_pages.SetLabel(f"Failed pages: {total_failed_pages}")
 
         # sync final counts so status labels show zero
         self._pages_done = self._total_pages
@@ -2105,6 +2201,10 @@ class PDFParserFrame(wx.Frame):
         self._is_processing = False
         self._enable_ui(True)
         self.converter_thread = None
+        
+        # Apply the final default order:
+        # Error → Few Chars → Done, unless the user sorted manually.
+        self._apply_default_status_order()
 
 
     def _enable_ui(self, enable: bool) -> None:
@@ -2114,8 +2214,16 @@ class PDFParserFrame(wx.Frame):
         self.btn_add_folder.Enable(enable)
         self.btn_remove.Enable(enable)
         self.btn_clear.Enable(enable)
-        for chk in (self.chk_images, self.chk_drawings, self.chk_formulas, self.chk_margin,
-                     self.chk_hyphen, self.chk_metadata, self.chk_post_only):
+        for chk in (
+            self.chk_images,
+            self.chk_drawings,
+            self.chk_formulas,
+            self.chk_margin,
+            self.chk_hyphen,
+            self.chk_metadata,
+            self.chk_preserve_layout,
+            self.chk_post_only,
+        ):
             chk.Enable(enable)
         self.spin_cores.Enable(enable)
         self.spin_min_size.Enable(enable)
