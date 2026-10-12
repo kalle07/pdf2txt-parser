@@ -5,10 +5,9 @@
 or: https://github.com/kalle07/pdf2txt-parser/releases/download/v8c/PDFParser-by-kalle07.exe
 <br>
 <br>
-📥 Downloads: <!--download-count-->063<!--/download-count--> actual version
+📥 Downloads: <!--download-count-->063<!--/download-count--> 
 <br>
 
-<br>
 <br>
 <b>The PDF Parser is a high-performance desktop application for extracting text, tables, images, drawings, and metadata from PDF documents. Built for speed with multi-core processing and batch conversion, it helps researchers, engineers, businesses, and developers convert large PDF collections into clean, searchable text while preserving valuable document information.<br>
 
