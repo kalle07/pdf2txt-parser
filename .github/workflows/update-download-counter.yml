@@ -27,26 +27,22 @@ jobs:
         run: |
           set -euo pipefail
 
-          ASSET_NAME="PDFParser-by-kalle07.exe"
-
-          RELEASE_JSON=$(curl -fsSL \
+          RELEASES_JSON=$(curl -fsSL \
             -H "Authorization: Bearer $GITHUB_TOKEN" \
             -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${{ github.repository }}/releases/latest")
-            # https://api.github.com/repos/${{ github.repository }}/releases/tags/v1.2.3 for individual releases
+            "https://api.github.com/repos/${{ github.repository }}/releases?per_page=100")
 
-          ASSET_ID=$(echo "$RELEASE_JSON" | jq -r --arg name "$ASSET_NAME" '.assets[] | select(.name == $name) | .id' | head -n 1)
-
-          if [ -z "$ASSET_ID" ] || [ "$ASSET_ID" = "null" ]; then
-            echo "Asset not found: $ASSET_NAME"
-            exit 1
-          fi
-
-          DOWNLOAD_COUNT=$(curl -fsSL \
-            -H "Authorization: Bearer $GITHUB_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${{ github.repository }}/releases/assets/$ASSET_ID" \
-            | jq -r '.download_count')
+          DOWNLOAD_COUNT=$(echo "$RELEASES_JSON" | jq -r '
+            [
+              .[]
+              | .assets[]
+              | select(
+                  (.name | ascii_downcase | endswith(".exe"))
+                )
+              | .download_count
+            ]
+            | add // 0
+          ')
 
           echo "count=$DOWNLOAD_COUNT" >> "$GITHUB_OUTPUT"
 
