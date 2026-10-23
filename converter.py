@@ -252,7 +252,7 @@ def create_processing_tasks(
         else:
             # Large file — split into 8-page chunks so workers stay
             # responsive and the executor can interleave files.
-            chunk_size = 8
+            chunk_size = 10
             current_page = 1
             while current_page <= page_count:
                 pages_in_chunk = min(chunk_size, page_count - current_page + 1)
@@ -356,15 +356,195 @@ def assemble_results(
 
 
 
+
 # ----------------------------------------------------------------------
-# PDF validation
+# PDF Convertibility / validation Check
 # ----------------------------------------------------------------------
 
 
 # ----------------------------------------------------------------------
-# PDF Convertibility Check
+# PDF validation (single open per file)
 # ----------------------------------------------------------------------
 
+class PDFValidator:
+    """Validate PDF files before they are processed.
+
+    Each call to ``validate_file`` opens the document **once** and performs
+    every check (encryption, repair, convertibility) on that single handle.
+    """
+
+    @staticmethod
+    def _check_convertibility(
+        doc: pymupdf.Document, max_pages: int = 10
+    ) -> tuple[bool, bool, bool]:
+        """Analyze the first *max_pages* pages of an already-open document."""
+        total_printable_ratio = 0.0
+        total_replacement = 0
+        total_strange = 0
+        pages_checked = 0
+
+        for i in range(min(max_pages, doc.page_count)):
+            try:
+                text = doc[i].get_text("text")
+            except Exception:
+                text = ""
+
+            if not text:
+                printable_ratio = 0.0
+            else:
+                printable_chars = sum(
+                    1 for ch in text if ch.isprintable() or ch in "\n\r\t"
+                )
+                printable_ratio = printable_chars / len(text)
+
+            total_printable_ratio += printable_ratio
+            total_replacement += text.count("\ufffd")
+            total_strange += sum(
+                1 for ch in text if ord(ch) < 32 and ch not in "\n\r\t"
+            )
+            pages_checked += 1
+
+        if pages_checked == 0:
+            return True, False, False
+
+        avg_printable = total_printable_ratio / pages_checked
+        avg_replacement = total_replacement / pages_checked
+        avg_strange = total_strange / pages_checked
+
+        return (
+            avg_printable < 0.05,
+            avg_replacement > 20,
+            avg_strange > 200,
+        )
+
+
+    @staticmethod
+    def validate_file(pdf_path: str) -> Dict[str, Any]:
+        """Inspect a single PDF for validity, corruption, protection, and convertibility.
+
+        The document is opened exactly once.  The returned dict contains:
+
+        * ``filename`` – original file name
+        * ``path`` – absolute path
+        * ``valid`` – ``True`` if the file can be opened and is convertible
+        * ``page_count`` – number of pages (``None`` if invalid)
+        * ``reason`` – human-readable explanation when ``valid`` is ``False``
+        * ``is_repaired`` – ``True`` if PyMuPDF repaired the file
+        * ``is_protected`` – ``True`` if the file is encrypted
+        * ``metadata`` – cleaned PDF metadata dict
+        """
+        filename = Path(pdf_path).name
+        result: Dict[str, Any] = {
+            "filename": filename,
+            "path": str(pdf_path),
+            "valid": False,
+            "page_count": None,
+            "reason": None,
+            "is_repaired": False,
+            "is_protected": False,
+            "metadata": {},
+        }
+
+        try:
+
+                
+            pymupdf.TOOLS.reset_mupdf_warnings()
+            doc = pymupdf.open(pdf_path)
+
+            if doc.is_encrypted:
+                result["is_protected"] = True
+                result["reason"] = "File is encrypted/protected"
+                doc.close()
+                return result
+
+            if doc.is_repaired:
+                result["is_repaired"] = True
+
+            pymupdf.TOOLS.mupdf_warnings(reset=True)
+            result["page_count"] = len(doc)
+            result["metadata"] = _clean_pdf_metadata(doc.metadata)
+            # result["metadata"]["page_count"] = len(doc)
+
+            # Convertibility check on the already-open document
+            low_print, high_repl, high_ctrl = PDFValidator._check_convertibility(doc)
+            if low_print or high_repl or high_ctrl:
+                result["valid"] = False
+                reasons = []
+                if low_print:
+                    reasons.append("Low printable character ratio")
+                if high_repl:
+                    reasons.append("High number of replacement characters (U+FFFD)")
+                if high_ctrl:
+                    reasons.append("High number of strange control characters")
+                result["reason"] = "Likely non-convertible to text: " + ", ".join(reasons)
+            else:
+                result["valid"] = True
+
+            doc.close()
+        except pymupdf.FileDataError as exc:
+            result["reason"] = f"Corrupted file or invalid PDF structure: {exc}"
+        except Exception as exc:
+            result["reason"] = f"Open failed: {type(exc).__name__}: {exc}"
+            
+
+        return result
+
+
+def validate_pdfs_parallel(
+    pdf_paths: List[str],
+    max_workers: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """Validate multiple PDFs concurrently.
+
+    Each file is handled by a separate worker process; the document is opened
+    exactly once per file.  Results are returned in the same order as *pdf_paths*.
+
+    Args:
+        pdf_paths: Absolute paths to the PDF files.
+        max_workers: Maximum concurrent processes (defaults to physical cores - 1).
+
+    Returns:
+        A list of result dicts (one per input path, same order).
+    """
+    if not pdf_paths:
+        return []
+
+    if max_workers is None:
+        max_workers = max(1, get_physical_cores() - 1)
+    max_workers = max(1, max_workers)
+
+    if len(pdf_paths) <= max_workers:
+        # Avoid process-creation overhead for small batches
+        return [PDFValidator.validate_file(p) for p in pdf_paths]
+
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(PDFValidator.validate_file, path): path
+            for path in pdf_paths
+        }
+        results: Dict[str, Dict[str, Any]] = {}
+        for future in as_completed(futures):
+            path = futures[future]
+            try:
+                results[path] = future.result()
+            except Exception as exc:
+                results[path] = {
+                    "filename": Path(path).name,
+                    "path": path,
+                    "valid": False,
+                    "page_count": None,
+                    "reason": f"Validation worker error: {exc}",
+                    "is_repaired": False,
+                    "is_protected": False,
+                    "metadata": {},
+                }
+
+    # Preserve original input order
+    return [results[p] for p in pdf_paths]
+
+
+
+'''
 class PDFCheckResult(NamedTuple):
     """Results of the PDF convertibility check."""
     low_printable_ratio: bool      # True if avg printable ratio < 80%
@@ -379,8 +559,9 @@ class PDFCheckResult(NamedTuple):
             or self.high_replacement_chars
             or self.high_strange_control_chars
         )
+'''
 
-
+'''
 def check_pdf_convertibility(
     pdf_path: str,
     max_pages: int = 10,
@@ -390,7 +571,7 @@ def check_pdf_convertibility(
 
     Analyzes the first `max_pages` pages and flags the PDF as non-convertible
     if any of these conditions are met:
-      - Average printable character ratio < 80%
+      - Average printable character ratio < 5%
       - Average replacement characters (U+FFFD) > 20 per page
       - Average strange control characters > 200 per page
 
@@ -458,88 +639,13 @@ def check_pdf_convertibility(
     average_strange_control_chars = total_strange_control_chars / pages_checked
 
     return PDFCheckResult(
-        low_printable_ratio=average_printable_ratio < 0.80,
+        low_printable_ratio=average_printable_ratio < 0.05,
         high_replacement_chars=average_replacement_chars > 20,
         high_strange_control_chars=average_strange_control_chars > 200,
     )
 
+'''
 
-
-
-class PDFValidator:
-    """Validate PDF files before they are processed."""
-
-    @staticmethod
-    def validate_file(pdf_path: str) -> Dict[str, Any]:
-        """Inspect a single PDF file for validity, corruption, and protection.
-
-        The returned dict contains:
-
-        * ``filename`` – original file name,
-        * ``path`` – absolute path,
-        * ``valid`` – ``True`` if the file can be opened,
-        * ``page_count`` – number of pages (``None`` if invalid),
-        * ``reason`` – human‑readable explanation when ``valid`` is ``False``,
-        * ``is_repaired`` – ``True`` if PyMuPDF repaired the file,
-        * ``is_protected`` – ``True`` if the file is encrypted.
-        """
-        filename = Path(pdf_path).name
-        result = {
-            "filename": filename,
-            "path": str(pdf_path),
-            "valid": False,
-            "page_count": None,
-            "reason": None,
-            "is_repaired": False,
-            "is_protected": False,
-            "metadata": {},
-        }
-
-        try:
-            pymupdf.TOOLS.reset_mupdf_warnings()
-            doc = pymupdf.open(pdf_path)
-
-            if doc.is_encrypted:
-                result["is_protected"] = True
-                result["valid"] = False
-                result["reason"] = "File is encrypted/protected"
-                doc.close()
-                return result
-
-            if doc.is_repaired:
-                result["is_repaired"] = True
-
-            warnings = pymupdf.TOOLS.mupdf_warnings(reset=True)
-            result["valid"] = True
-            result["page_count"] = len(doc)
-            result["metadata"] = _clean_pdf_metadata(doc.metadata)
-            result["metadata"]["page_count"] = len(doc)
-
-            if warnings:
-                print(f"Warning for '{filename}': {warnings}")
-
-            # --- NEW: Check Convertibility ---
-            check_result = check_pdf_convertibility(pdf_path, max_pages=10)
-            if not check_result.is_convertible:
-                result["valid"] = False
-                reasons = []
-                if check_result.low_printable_ratio:
-                    reasons.append("Low printable character ratio")
-                if check_result.high_replacement_chars:
-                    reasons.append("High number of replacement characters (U+FFFD)")
-                if check_result.high_strange_control_chars:
-                    reasons.append("High number of strange control characters")
-                
-                result["reason"] = "Likely non-convertible to text: " + ", ".join(reasons)
-            # -------------------------------
-
-            doc.close()
-        except pymupdf.FileDataError as exc:
-            result["reason"] = f"Corrupted file or invalid PDF structure: {exc}"
-        except Exception as exc:
-            result["reason"] = f"Open failed: {type(exc).__name__}: {exc}"
-
-        return result
 
 
 # ----------------------------------------------------------------------
@@ -1574,12 +1680,7 @@ class PageProcessor:
 # High‑level PDF converter (orchestrates multiprocessing)
 # ----------------------------------------------------------------------
 class PDFConverter:
-    """Main entry point that converts a list of PDFs to plain‑text files.
-
-    The class encapsulates configuration, validation, task creation, and
-    multiprocessing execution.  It is deliberately thin – most of the heavy
-    lifting lives in ``PageProcessor`` and its helpers.
-    """
+    """Main entry point that converts a list of PDFs to plain-text files."""
 
     def __init__(
         self,
@@ -1588,8 +1689,8 @@ class PDFConverter:
         stop_flag: Optional[Any] = None,
     ):
         self.config = config or ConversionConfig()
-        self.progress_callback = progress_callback  # (pdf_name, page_done, total, imgs, dws)
-        self.stop_flag = stop_flag  # threading.Event – checked between chunks
+        self.progress_callback = progress_callback
+        self.stop_flag = stop_flag
 
     def convert_parallel(
         self,
@@ -1597,59 +1698,56 @@ class PDFConverter:
         output_dir: str,
         cores: int = None,
         output_in_source_dir: bool = True,
+        pre_validated: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """Convert many PDFs in parallel and return aggregated statistics.
 
-        Steps performed:
-
-        1. Validate each PDF (skipping corrupted or protected files).
-        2. Clear any existing ``_media`` folders so stale images/drawings from
-           previous runs do not persist.
-        3. Build processing tasks based on core count and page count.
-        4. Dispatch tasks to a ``ProcessPoolExecutor``.
-        5. Assemble per‑page results into a single ``.txt`` file per PDF.
-        6. Merge per‑file stats into a global summary.
-
-        When ``output_in_source_dir`` is ``True``, each PDF's .txt and _media
-        folder are written next to the original PDF instead of *output_dir*.
-
-        All side‑effects (file writes, multiprocessing) are confined to this
-        method.
+        Args:
+            pdf_files: Paths to the PDF files to convert.
+            output_dir: Fallback output directory (unused when
+                *output_in_source_dir* is True).
+            cores: Number of worker processes (defaults to physical cores).
+            output_in_source_dir: Write .txt and _media next to the PDF.
+            pre_validated: Optional list of validation result dicts (one per
+                file in *pdf_files*, same order).  When provided, the
+                converter skips re-validation entirely.
         """
         if cores is None:
             cores = get_physical_cores()
 
-        valid_files = self._collect_valid_files(pdf_files)
+        # Build the file-info list from pre-validated results (no re-open).
+        if pre_validated is not None:
+            valid_files = self._build_file_info_from_validation(
+                pdf_files, pre_validated
+            )
+        else:
+            # Fallback: validate sequentially (backward-compatible path)
+            valid_files = self._collect_valid_files(pdf_files)
+
 
         if not valid_files:
             print("No valid PDFs found")
             return {}
 
-        # Clear stale media folder contents before processing
-        self._clear_media_folders(valid_files, output_in_source_dir, output_dir)
-
         tasks = create_processing_tasks(valid_files, cores)
-        
         global_stats = self._create_global_stats()
         results_by_file = self._run_tasks(tasks, output_dir, cores, global_stats)
 
-        # Build a lookup of original source directory per filename
         source_dirs: Dict[str, str] = {}
         for fi in valid_files:
             source_dirs[fi["filename"]] = os.path.dirname(os.path.abspath(fi["path"]))
 
         metadata_by_file = {
-            file_info["filename"]: file_info.get("metadata", {})
-            for file_info in valid_files
+            fi["filename"]: fi.get("metadata", {}) for fi in valid_files
         }
 
-        # Write each PDF's results and merge per‑file stats back into ``global_stats``
         per_file_stats: Dict[str, Dict[str, int]] = {}
         for pdf_filename, results in results_by_file.items():
-            if output_in_source_dir:
-                target_dir = source_dirs.get(pdf_filename, output_dir)
-            else:
-                target_dir = output_dir
+            target_dir = (
+                source_dirs.get(pdf_filename, output_dir)
+                if output_in_source_dir
+                else output_dir
+            )
             output_file = os.path.join(target_dir, f"{pdf_filename}.txt")
             media_dir = os.path.join(target_dir, f"{pdf_filename}_media")
             file_stats = assemble_results(
@@ -1665,6 +1763,31 @@ class PDFConverter:
 
         global_stats["per_file"] = per_file_stats
         return global_stats
+
+    def _build_file_info_from_validation(
+        self,
+        pdf_files: List[str],
+        validation_results: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Assemble the internal file-info list from pre-computed validation
+        results without re-opening any document."""
+        valid_files: List[Dict[str, Any]] = []
+        for path, result in zip(pdf_files, validation_results):
+            if not result.get("valid"):
+                continue
+            valid_files.append(
+                {
+                    "path": path,
+                    "page_count": result["page_count"],
+                    "filename": Path(path).stem,
+                    "metadata": result.get("metadata", {}),
+                }
+            )
+        return valid_files
+
+
+    # _collect_valid_files kept as-is for backward compatibility
+    # (called only when pre_validated is None)
 
     def _collect_valid_files(self, pdf_files: List[str]) -> List[Dict[str, Any]]:
         """Return only those PDFs that can be opened and are not encrypted.
@@ -1902,6 +2025,3 @@ def run_full_conversion(
     print(f"Pages Processed: {pages}")
     print(f"Pages per Second: {pages_per_second:.2f}")
     return global_stats
-
-
-

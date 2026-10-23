@@ -143,13 +143,14 @@ class PDFFolderDropTarget(wx.FileDropTarget):
 @dataclass
 class FileInfo:
     """Holds metadata for a single PDF entry in the file list."""
-
     path: str = ""
     name: str = ""
     pages: int = 0
     status: str = "Scanning..."
     error: str = ""
-    pages_done: int = 0          # pages processed so far (during conversion)
+    pages_done: int = 0
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
 
 # --------------------------------------------------------------------------- #
 #  Worker thread
@@ -166,6 +167,7 @@ class ConverterThread(Thread):
         progress_callback: Optional[Callable[[], None]] = None,
         finish_callback: Optional[Callable[[], None]] = None,
         stop_flag: Optional[Event] = None,
+        pre_validated: Optional[List[Dict[str, Any]]] = None,
     ):
         super().__init__(daemon=True)
         self.pdf_files = pdf_files
@@ -175,6 +177,7 @@ class ConverterThread(Thread):
         self.progress_callback = progress_callback
         self.finish_callback = finish_callback
         self.stop_flag = stop_flag
+        self.pre_validated = pre_validated
         self.global_stats: Dict[str, Any] = {}
 
     def run(self) -> None:
@@ -189,6 +192,7 @@ class ConverterThread(Thread):
             self.output_folder,
             self.cores,
             output_in_source_dir=True,
+            pre_validated=self.pre_validated,
         )
         elapsed = time.time() - start_time
         pages = self.global_stats.get("total_pages", 0)
@@ -204,6 +208,7 @@ class ConverterThread(Thread):
                     stats=self.global_stats,
                 )
             )
+
 
 # --------------------------------------------------------------------------- #
 #  Post-process thread – fills descriptions from existing .txt + _media only
@@ -247,22 +252,70 @@ class PostProcessThread(Thread):
 #  Scan thread – counts pages of added PDFs without blocking the GUI
 # --------------------------------------------------------------------------- #
 class ScanThread(Thread):
-    """Validate PDFs and fill in page counts."""
+    """Validate PDFs in parallel and report each result as soon as it completes."""
 
-    def __init__(self, pdf_paths: List[str], callback: Callable):
+    def __init__(self, pdf_paths: List[str], callback: Callable, max_workers: int):
         super().__init__(daemon=True)
         self.pdf_paths = pdf_paths
         self.callback = callback
+        self.max_workers = max(1, max_workers)
+        self._pending_count = len(pdf_paths)
 
     def run(self) -> None:
-        for path in self.pdf_paths:
-            result = PDFValidator.validate_file(path)
-            self.callback(
-                path=path,
-                valid=result["valid"],
-                pages=result.get("page_count", 0),
-                reason=result.get("reason", ""),
-            )
+        from converter import PDFValidator
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+
+        if not self.pdf_paths:
+            return
+
+        max_workers = self.max_workers
+
+        # For small batches, avoid process-creation overhead
+        if len(self.pdf_paths) <= max_workers:
+            for path in self.pdf_paths:
+                result = PDFValidator.validate_file(path)
+                wx.CallAfter(
+                    self.callback,
+                    path=result["path"],
+                    valid=result["valid"],
+                    pages=result.get("page_count") or 0,
+                    reason=result.get("reason", ""),
+                    metadata=result.get("metadata", {}),
+                )
+            return
+
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(PDFValidator.validate_file, path): path
+                for path in self.pdf_paths
+            }
+
+            # Report each result IMMEDIATELY as it completes, not in a batch at the end.
+            for future in as_completed(futures):
+                path = futures[future]
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    result = {
+                        "filename": Path(path).name,
+                        "path": path,
+                        "valid": False,
+                        "page_count": None,
+                        "reason": f"Validation worker error: {exc}",
+                        "is_repaired": False,
+                        "is_protected": False,
+                        "metadata": {},
+                    }
+
+                wx.CallAfter(
+                    self.callback,
+                    path=result["path"],
+                    valid=result["valid"],
+                    pages=result.get("page_count") or 0,
+                    reason=result.get("reason", ""),
+                    metadata=result.get("metadata", {}),
+                )
+
 
 
 
@@ -477,6 +530,7 @@ class PDFParserFrame(wx.Frame):
         # running sums updated as scanning completes
         self._total_pages_all: int = 0
         self._total_files_all: int = 0
+        self._pending_scan_count: int = 0 
 
         self._col_widths: Dict[int, int] = {}
 
@@ -511,6 +565,11 @@ class PDFParserFrame(wx.Frame):
 
         self.Bind(wx.EVT_TIMER, self._on_column_drag_timer,
                   self._column_drag_timer)
+
+        self._scan_update_timer = wx.Timer(self)
+        #self.Bind(wx.EVT_TIMER, self._on_scan_batch_complete, self._scan_update_timer)
+        self._pending_scan_paths: List[str] = []
+        self._needs_resort: bool = False
 
 
     def _truncate_path_left(self, path: str, max_width: int) -> str:
@@ -868,24 +927,21 @@ class PDFParserFrame(wx.Frame):
 
 
     def _sort_file_list(self, column: int, descending: bool) -> None:
-        """Sort FileInfo objects and rebuild the ListCtrl rows."""
+        """Sort FileInfo objects and rebuild the ListCtrl rows.
+
+        Skips the (expensive) rebuild entirely when the order hasn't changed.
+        Preserves the vertical scroll position when a rebuild is necessary.
+        """
         if not self.file_info:
             return
 
         items = list(self.file_info.values())
 
         if column == 0:
-            # Alphabetical by filename, case-insensitive.
             key_func = lambda fi: fi.name.casefold()
-
         elif column == 1:
-            # Numeric page count.
             key_func = lambda fi: fi.pages
-
         elif column == 3:
-            # Requested order:
-            # Ready -> Processing -> Done
-            # Error/Scanning are placed after the normal states.
             status_order = {
                 "Error": 0,
                 "Few Chars": 1,
@@ -895,29 +951,25 @@ class PDFParserFrame(wx.Frame):
                 "Scanning...": 5,
             }
             key_func = lambda fi: status_order.get(fi.status, 99)
-
         elif column == 4:
             key_func = lambda fi: self._file_list_number(fi, 4)
-
         elif column == 5:
             key_func = lambda fi: self._file_list_number(fi, 5)
-
         else:
             return
 
         items.sort(key=key_func, reverse=descending)
 
-        # Rebuild the dictionary so dictionary index == ListCtrl row.
-        self.file_info = {
-            idx: fi
-            for idx, fi in enumerate(items)
-        }
+        # Fast-path: if the sorted order matches the current order, nothing moved.
+        if [id(fi) for fi in items] == [id(fi) for fi in self.file_info.values()]:
+            return
 
-        # Rebuild the visible list.
+
+        self.file_info = {idx: fi for idx, fi in enumerate(items)}
+
         self.file_list.Freeze()
         try:
             self.file_list.DeleteAllItems()
-
             width = self.file_list.GetColumn(0).GetWidth() - 10
 
             for idx, fi in self.file_info.items():
@@ -925,66 +977,37 @@ class PDFParserFrame(wx.Frame):
                     idx,
                     self._truncate_path_left(fi.path, width),
                 )
-
                 self.file_list.SetItem(
-                    idx,
-                    1,
-                    str(fi.pages) if fi.pages else "…",
+                    idx, 1, str(fi.pages) if fi.pages else "\u2026",
                 )
 
                 if fi.status == "Error":
-                    progress = "—"
-                    status_text = fi.error or "Error"
-                    colour = self.C_ERROR
-
+                    progress, status_text, colour = "\u2014", fi.error or "Error", self.C_ERROR
                 elif fi.status == "Scanning...":
-                    progress = "…"
-                    status_text = fi.status
-                    colour = self.C_SCANNING
-
+                    progress, status_text, colour = "\u2026", fi.status, self.C_SCANNING
                 elif fi.status == "Ready":
-                    progress = f"{fi.pages} / 0"
-                    status_text = fi.status
-                    colour = self.C_READY
-
+                    progress, status_text, colour = f"{fi.pages} / 0", fi.status, self.C_READY
                 elif fi.status == "Processing":
-                    progress = f"{fi.pages - fi.pages_done} / {fi.pages_done}"
-                    status_text = fi.status
-                    colour = self.C_PROCESS
-
+                    progress, status_text, colour = (
+                        f"{fi.pages - fi.pages_done} / {fi.pages_done}", fi.status, self.C_PROCESS,
+                    )
                 elif fi.status == "Done":
-                    progress = f"0 / {fi.pages}"
-                    status_text = fi.status
-                    colour = self.C_DONE
-
+                    progress, status_text, colour = f"0 / {fi.pages}", fi.status, self.C_DONE
                 elif fi.status == "Few Chars":
-                    progress = f"0 / {fi.pages}"
-                    status_text = fi.status
-                    colour = self.C_FEW_CHARS
-
+                    progress, status_text, colour = f"0 / {fi.pages}", fi.status, self.C_FEW_CHARS
                 else:
-                    progress = "…"
-                    status_text = fi.status
-                    colour = self.C_PENDING
+                    progress, status_text, colour = "\u2026", fi.status, self.C_PENDING
 
                 self.file_list.SetItem(idx, 2, progress)
                 self.file_list.SetItem(idx, 3, status_text)
-                self.file_list.SetItem(
-                    idx,
-                    4,
-                    self._file_list_media_value(fi, 4),
-                )
-                self.file_list.SetItem(
-                    idx,
-                    5,
-                    self._file_list_media_value(fi, 5),
-                )
+                self.file_list.SetItem(idx, 4, self._file_list_media_value(fi, 4))
+                self.file_list.SetItem(idx, 5, self._file_list_media_value(fi, 5))
                 self.file_list.SetItemTextColour(idx, colour)
-
         finally:
             self.file_list.Thaw()
 
         self._refresh_file_paths()
+
 
 
     def _apply_default_status_order(self) -> None:
@@ -1564,15 +1587,15 @@ class PDFParserFrame(wx.Frame):
     #  File management
     # ==================================================================== #
     def _add_to_list(self, paths: List[str]) -> None:
-        """Add PDF paths to the list and start background scan."""
+        """Add PDF paths to the list and start parallel background validation."""
         new_paths: List[str] = []
         for p in paths:
             if not p.lower().endswith(".pdf"):
                 continue
             if p in [self.file_info[i].path for i in self.file_info]:
-                continue  # duplicate
+                continue
             idx = self.file_list.GetItemCount()
-            fi = FileInfo(path=p, name=Path(p).stem)  # stem matches converter's pdf_filename
+            fi = FileInfo(path=p, name=Path(p).stem)
             self.file_info[idx] = fi
 
             self.file_list.InsertItem(
@@ -1582,15 +1605,18 @@ class PDFParserFrame(wx.Frame):
                     self.file_list.GetColumn(0).GetWidth() - 10,
                 ),
             )
-
-            self.file_list.SetItem(idx, 1, "…")
-            self.file_list.SetItem(idx, 2, "…")
+            self.file_list.SetItem(idx, 1, "\u2026")
+            self.file_list.SetItem(idx, 2, "\u2026")
             self.file_list.SetItem(idx, 3, fi.status)
             self.file_list.SetItemTextColour(idx, self.C_SCANNING)
             new_paths.append(p)
 
         if new_paths:
-            ScanThread(new_paths, callback=self._on_scan_result).start()
+            # Reserve one core for the GUI; the rest go to validation workers.
+            self._pending_scan_count += len(new_paths) 
+            workers = max(1, get_physical_cores() - 1)
+            ScanThread(new_paths, callback=self._update_scan_result, max_workers=workers).start()
+
 
     def _on_add(self, _evt: wx.CommandEvent) -> None:
         with wx.FileDialog(
@@ -1754,74 +1780,116 @@ class PDFParserFrame(wx.Frame):
 
 
 
-    # ---- scan callback ----
-    def _on_scan_result(self, path: str, valid: bool, pages: int, reason: str) -> None:
-        """Called from the scan thread – schedules a GUI update via wx.CallAfter."""
-        wx.CallAfter(
-            self._update_scan_result,
-            path=path,
-            valid=valid,
-            pages=pages,
-            reason=reason,
-        )
-
     def _update_scan_result(
-        self, path: str, valid: bool, pages: int, reason: str
+        self,
+        path: str,
+        valid: bool,
+        pages: int,
+        reason: str,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """GUI‑thread callback applied after a PDF has been validated."""
+        """Called via wx.CallAfter — accumulate updates and flush on a timer."""
+        self._pending_scan_count = max(0, self._pending_scan_count - 1)
+
+        found = False
         for idx, fi in self.file_info.items():
             if fi.path == path:
+                found = True
                 fi.pages = pages if valid else 0
                 fi.error = reason if not valid else ""
+                if metadata:
+                    fi.metadata = metadata
 
                 if valid:
-                    # Check if .txt file already exists from a previous conversion
                     txt_path = os.path.splitext(fi.path)[0] + ".txt"
                     if os.path.exists(txt_path):
                         fi.status = "Done"
-                        # 0 left / X converted
                         self.file_list.SetItem(idx, 2, f"0 / {fi.pages}")
                         self.file_list.SetItem(idx, 3, fi.status)
                         self.file_list.SetItemTextColour(idx, self.C_DONE)
                     else:
                         fi.status = "Ready"
-                        # X left / 0 converted
                         self.file_list.SetItem(idx, 2, f"{fi.pages} / 0")
                         self.file_list.SetItem(idx, 3, fi.status)
                         self.file_list.SetItemTextColour(idx, self.C_READY)
                 else:
                     fi.status = "Error"
-                    self.file_list.SetItem(idx, 2, "—")
+                    self.file_list.SetItem(idx, 2, "\u2014")
                     self.file_list.SetItem(idx, 3, fi.error or "Error")
                     self.file_list.SetItemTextColour(idx, self.C_ERROR)
+
+                # Flag a resort only if this file's status changed from "Scanning..."
+                # to a terminal state (Ready / Error / Done).
+                if fi.status != "Scanning...":
+                    self._needs_resort = True
                 break
 
-        # recalculate running sums and update status labels
+        if not found:
+            return
+
+        # Recalculate running sums
         self._total_files_all = len(self.file_info)
         self._total_pages_all = sum(fi.pages for fi in self.file_info.values())
         self.lbl_pdf_left.SetLabel(f"PDFs left: {self._total_files_all}")
         self.lbl_pages_left.SetLabel(f"Pages left: {self._total_pages_all}")
-        # Keep the default order unless the user has manually sorted.
-        self._apply_default_status_order()
+
+        # If this was the last pending scan, trigger a final sort by Status.
+        if self._pending_scan_count <= 0:
+            # Ensure no other scans are queued before sorting.
+            # We use wx.CallAfter to ensure the UI has processed all current updates.
+            wx.CallAfter(self._apply_default_status_order)
+        else:
+            # Restart the debounce timer for intermediate updates if needed,
+            # but since we only want ONE sort at the end, we can skip intermediate sorting
+            # or keep it if you prefer live updates. 
+            # For "sort once after validation", we can simply do nothing here until count is 0.
+            pass
+
+
+        # Restart the debounce timer — only sort/rebuild when no new results
+        # arrive for 300 ms.
+        if not self._scan_update_timer.IsRunning():
+            self._scan_update_timer.Start(300)
+
+
+
+
 
     # ==================================================================== #
     #  Conversion
     # ==================================================================== #
     def _on_start(self, _evt: wx.CommandEvent) -> None:
-        # Post-process-only mode branches off before any PDF work.
         if self.chk_post_only.GetValue():
             self._start_post_process()
             return
 
+        # Collect files that passed validation (no re-open).
+        pdf_files: List[str] = []
+        pre_validated: List[Dict[str, Any]] = []
+        for idx, fi in self.file_info.items():
+            if fi.status in ("Ready", "Done"):
+                pdf_files.append(fi.path)
+                pre_validated.append({
+                    "filename": fi.name,
+                    "path": fi.path,
+                    "valid": True,
+                    "page_count": fi.pages,
+                    "reason": None,
+                    "is_repaired": False,
+                    "is_protected": False,
+                    "metadata": fi.metadata,
+                })
+        '''
         # gather files eligible for conversion (both newly added and previously converted)
         pdf_files: List[str] = []
         for idx, fi in self.file_info.items():
             if fi.status in ("Ready", "Done"):
                 pdf_files.append(fi.path)
+        '''
 
         if not pdf_files:
             wx.MessageBox("No PDF files found to convert.", "Error", wx.OK | wx.ICON_ERROR)
-            return  # UI stays enabled — user can add files
+            return
 
         save_images = self.chk_images.GetValue()
         save_drawings = self.chk_drawings.GetValue()
@@ -1886,12 +1954,13 @@ class PDFParserFrame(wx.Frame):
         # start worker
         self.converter_thread = ConverterThread(
             pdf_files=pdf_files,
-            output_folder=".",  # dummy – we use source dirs
+            output_folder=".",
             cores=self.spin_cores.GetValue(),
             config=config,
             progress_callback=self._throttled_progress,
             finish_callback=self._on_finish,
             stop_flag=self._stop_flag,
+            pre_validated=pre_validated,
         )
         self.converter_thread.start()
 
