@@ -75,6 +75,10 @@ class ConversionConfig:
     bbox_padding: float = 20.0
     min_block_size_px: int = 5
 
+    # Insert spaces between extracted words only when their horizontal gap
+    # exceeds this fraction of their average word-box height.
+    word_space_gap_ratio: float = 0.10
+
     min_items_per_cluster: int = 8
     include_small_text_blocks: bool = True
 
@@ -694,10 +698,18 @@ class PageProcessor:
             "drawing_blocks": [],
         }
 
+        # Reconstruct the original text blocks from PyMuPDF's word geometry.
+        # The original block bboxes and block grouping remain unchanged.
+        page_text_blocks = self._get_text_blocks_with_word_spacing(page)
+
         # ------------------------------------------------------------------
         # 1️⃣ Extract tables
         # ------------------------------------------------------------------
-        page_content.extend(self._process_tables(page, page_num, reference_bboxes))
+        page_content.extend(
+            self._process_tables(
+                page, page_num, reference_bboxes, page_text_blocks
+            )
+        )
 
         # ------------------------------------------------------------------
         # 2️⃣ Extract Cambria Math-heavy formula blocks before normal text
@@ -725,7 +737,7 @@ class PageProcessor:
         #    plain block covered by a drawing can be removed before emission.
         # ------------------------------------------------------------------
         plain_text_blocks = self._process_text_blocks(
-            page, page_num, reference_bboxes
+            page, page_num, reference_bboxes, page_text_blocks
         )
 
         # ------------------------------------------------------------------
@@ -893,11 +905,105 @@ class PageProcessor:
                         f"Overlap with larger image ({overlap_pct:.1%} coverage)"
                     )
 
+    def _get_text_blocks_with_word_spacing(
+        self, page: pymupdf.Page
+    ) -> List[Tuple]:
+        """Rebuild text inside the original blocks using word bounding boxes.
+
+        Block boundaries and bounding boxes come from ``get_text("blocks")``.
+        ``get_text("words")`` supplies the word positions used to decide where
+        spaces belong. Line detection is restricted to each original block.
+        """
+        blocks = page.get_text("blocks")
+        words = page.get_text(
+            "words",
+            flags=pymupdf.TEXTFLAGS_WORDS | pymupdf.TEXT_INHIBIT_SPACES
+        )        
+        if not blocks or not words:
+            return blocks
+
+        words_by_block: Dict[int, List[Tuple]] = {}
+        for word in words:
+            if len(word) >= 8:
+                words_by_block.setdefault(int(word[5]), []).append(word)
+
+        gap_ratio = max(0.0, float(self.config.word_space_gap_ratio))
+        rebuilt_blocks: List[Tuple] = []
+
+        for block_index, block in enumerate(blocks):
+            if len(block) < 5:
+                rebuilt_blocks.append(block)
+                continue
+
+            block_no = int(block[5]) if len(block) > 5 else block_index
+            block_words = words_by_block.get(block_no)
+            if not block_words:
+                rebuilt_blocks.append(block)
+                continue
+
+            # Group words on the same visual line, even when PyMuPDF gives
+            # fragments on one baseline different line_no values.
+            visual_lines: List[Dict[str, Any]] = []
+            for word in sorted(
+                block_words,
+                key=lambda item: ((float(item[1]) + float(item[3])) / 2, float(item[0])),
+            ):
+                height = max(0.1, float(word[3]) - float(word[1]))
+                center_y = (float(word[1]) + float(word[3])) / 2
+                matches = [
+                    line for line in visual_lines
+                    if abs(center_y - line["center_y"])
+                    <= 0.40 * (height + line["height"]) / 2
+                ]
+
+                if matches:
+                    line = min(matches, key=lambda item: abs(center_y - item["center_y"]))
+                    line["words"].append(word)
+                    line["center_sum"] += center_y
+                    line["center_y"] = line["center_sum"] / len(line["words"])
+                    line["height_sum"] += height
+                    line["height"] = line["height_sum"] / len(line["words"])
+                else:
+                    visual_lines.append({
+                        "words": [word],
+                        "center_y": center_y,
+                        "center_sum": center_y,
+                        "height": height,
+                        "height_sum": height,
+                    })
+
+            text_lines: List[str] = []
+            for line in sorted(visual_lines, key=lambda item: item["center_y"]):
+                line_words = sorted(line["words"], key=lambda item: float(item[0]))
+                parts = [str(line_words[0][4])]
+
+                for previous, current in zip(line_words, line_words[1:]):
+                    gap = float(current[0]) - float(previous[2])
+                    previous_height = max(0.0, float(previous[3]) - float(previous[1]))
+                    current_height = max(0.0, float(current[3]) - float(current[1]))
+                    allowed_gap = ((previous_height + current_height) / 2) * gap_ratio
+
+                    if gap > allowed_gap:
+                        parts.append(" ")
+                    parts.append(str(current[4]))
+
+                text_lines.append("".join(parts))
+
+            text = "\n".join(text_lines)
+            original_text = str(block[4])
+            trailing_newlines = len(original_text) - len(original_text.rstrip("\n"))
+            text += "\n" * trailing_newlines
+
+            rebuilt_blocks.append(tuple(block[:4]) + (text,) + tuple(block[5:]))
+
+        return rebuilt_blocks
+
     def _process_tables(
         self,
         page: pymupdf.Page,
         page_num: int,
         reference_bboxes: Dict[str, List[Tuple[float, float, float, float]]],
+        page_text_blocks: List[Tuple],
     ) -> List[str]:
         """Extract all tables from the page, filter them, and convert to JSON.
 
@@ -916,8 +1022,6 @@ class PageProcessor:
         if not tables_obj or not tables_obj.tables:
             return content
 
-        page_text_blocks = page.get_text("blocks")
-        
         table_num = 0
         for table in tables_obj.tables:
             table_num += 1
@@ -1046,6 +1150,7 @@ class PageProcessor:
         page: pymupdf.Page,
         page_num: int,
         reference_bboxes: Dict[str, List[Tuple[float, float, float, float]]],
+        blocks: List[Tuple],
     ) -> List[Tuple[Tuple[float, float, float, float], str, int]]:
         """Collect normal text blocks without emitting them yet.
 
@@ -1054,7 +1159,6 @@ class PageProcessor:
         overlap can suppress duplicate plain-text output.
         """
         content: List[Tuple[Tuple[float, float, float, float], str, int]] = []
-        blocks = page.get_text("blocks")
         sorted_blocks = self._sort_blocks_by_layout(blocks, page)
 
         for block in sorted_blocks:

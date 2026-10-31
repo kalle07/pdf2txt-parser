@@ -160,55 +160,75 @@ def remove_nonprintable_chars(text: str, preserve_line_breaks: bool = False) -> 
     return _COLLAPSIBLE_HORIZON.sub(" ", cleaned).strip()
 
 
-def fix_hyphenated_lines(text: str) -> Tuple[str, int]:
-    """Fix hyphenated line breaks while preserving paragraph structure.
+def _is_ignorable_after_line_end_hyphen(ch: str) -> bool:
+    """Return whether *ch* may occur between a line-end hyphen and newline.
 
-    Handles both normal hyphen and soft hyphen at line end:
-
-        ex-\nample  -> example
-        ex\u00ad\nample -> example
-
-    Single line breaks are left as line breaks here. Later,
-    `remove_nonprintable_chars()` converts single line breaks to spaces
-    while preserving multiple line breaks.
+    PDFs sometimes place ordinary/Unicode whitespace or invisible control and
+    formatting characters after the hyphen.  These characters should not stop
+    recognition of a line-end hyphen.  A soft hyphen is deliberately excluded:
+    it is a hyphen candidate, not trailing noise.
     """
+    if not ch or ch == "\u00ad":
+        return False
+    return ch.isspace() or unicodedata.category(ch) in {"Cc", "Cf"}
+
+
+def fix_hyphenated_lines(text: str) -> Tuple[str, int]:
+    """Remove line-end hyphens and all intervening whitespace/control characters."""
+
     if not isinstance(text, str):
         return text, 0
 
-    # Normalize line endings before processing.
     text = text.replace("\r\n", "\n").replace("\r", "\n")
-
-    # Make soft hyphens behave like normal hyphens before hyphen-joining logic. softhyphen some times bad
     text = _replace_soft_hyphens_contextually(text)
 
-    lines = text.split("\n")
-    fixed_lines: List[str] = []
+    MAX_GAP_CHARS = 2
+    MAX_LINE_BREAKS = 2
+
+    result = []
     fix_count = 0
-
     i = 0
-    while i < len(lines):
-        line = lines[i].strip()
 
-        if not line:
-            fixed_lines.append("")
-            i += 1
-            continue
+    while i < len(text):
+        # Only consider hyphens following a word character.
+        if (
+            text[i] == "-"
+            and i > 0
+            and text[i - 1].isalnum()
+        ):
+            j = i + 1
+            line_breaks = 0
 
-        # Detect normal hyphen or soft hyphen at the end of the line.
-        if re.search(r"[-\u00ad]\s*$", line):
-            next_line = lines[i + 1].strip() if i + 1 < len(lines) else ""
+            # Skip whitespace, control and formatting characters.
+            while (
+                j < len(text)
+                and j - i <= MAX_GAP_CHARS
+                and _is_ignorable_after_line_end_hyphen(text[j])
+            ):
+                if text[j] == "\n":
+                    line_breaks += 1
 
-            if next_line:
-                current_clean = re.sub(r"[-\u00ad]\s*$", "", line)
-                fixed_lines.append(current_clean + next_line)
+                if line_breaks > MAX_LINE_BREAKS:
+                    break
+
+                j += 1
+
+            # A hyphen is removed only if a line break was found
+            # and the next visible character starts a word.
+            if (
+                line_breaks > 0
+                and line_breaks <= MAX_LINE_BREAKS
+                and j < len(text)
+                and text[j].isalnum()
+            ):
                 fix_count += 1
-                i += 2
+                i = j
                 continue
 
-        fixed_lines.append(line)
+        result.append(text[i])
         i += 1
 
-    return "\n".join(fixed_lines), fix_count
+    return "".join(result), fix_count
 
 
 def count_non_whitespace_chars(text: str) -> int:
