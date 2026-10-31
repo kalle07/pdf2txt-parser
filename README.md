@@ -1,6 +1,6 @@
 # parsing / pdf parser
 -> with a nice old style GUI -> have FUN !!!<br>
--> update: 10/12/26 <b>PDF_Parser-by-Kalle07-v8c</b><br>
+-> update: 10/31/26 <b>PDF_Parser-by-Kalle07-v8d</b><br>
 -> on right side releases: windows exe available ! (no install - its selfrunning) <br>
 or: https://github.com/kalle07/pdf2txt-parser/releases/download/V8d/PDFParser-by-kalle07.exe
 <br>
