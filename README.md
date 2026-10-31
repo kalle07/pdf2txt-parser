@@ -90,7 +90,7 @@ When processing large amounts of data, the following should be noted:<br>
 3. Large files (≥32 pages) are split into chunks of ~8 pages per core.<br>
 4. Each page runs inside a separate ProcessPoolExecutor worker, fully isolated with its own ConversionConfig copy.<br>
 5. Results from all workers are collected and assembled in original page order before writing the final TXT file.<br>
-6. Speed: 8 cores  ~50 pages / sec<br><br>
+6. Speed: 8 cores  ~50 - 150 pages / sec<br><br>
 
 ...<br>
 
