@@ -105,7 +105,7 @@ download exe, no installation, direct working App<br>
 or via python
 ```
 *chose your folder*
-git clone https://github.com/kalle07/raw-txt-snippet-creator
+git clone https://github.com/kalle07/pdf2txt-parser
 python -m venv venv<br>
 venv\Scripts\activate  # On Windows<br>
 pip install -r requirements.txt<br>
