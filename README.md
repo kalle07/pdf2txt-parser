@@ -103,15 +103,15 @@ For the python-file oc you need to import missing libraries.<br>
 # INSTALL
 download exe, no installation, direct working App<br>
 or via python
-```
+```bash
 *chose your folder*
 git clone https://github.com/kalle07/pdf2txt-parser
-python -m venv venv<br>
-venv\Scripts\activate  # On Windows<br>
-pip install -r requirements.txt<br>
-python main.py<br><br>
+python -m venv venv
+venv\Scripts\activate  # On Windows
+pip install -r requirements.txt
+python main.py
 ```
-
+<br>
 <b>now have fun and leave a comment if you like  ;)</b><br>
 <br>
 my raw-txt-snippet extractor<br>
