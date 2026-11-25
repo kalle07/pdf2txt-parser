@@ -102,11 +102,15 @@ For the python-file oc you need to import missing libraries.<br>
 
 # INSTALL
 download exe, no installation, direct working App<br>
+or via python
+```
+*chose your folder*
+git clone https://github.com/kalle07/raw-txt-snippet-creator
 python -m venv venv<br>
 venv\Scripts\activate  # On Windows<br>
 pip install -r requirements.txt<br>
 python main.py<br><br>
-
+```
 
 <b>now have fun and leave a comment if you like  ;)</b><br>
 <br>
