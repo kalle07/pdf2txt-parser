@@ -107,7 +107,7 @@ or via python
 *chose your folder*
 git clone https://github.com/kalle07/pdf2txt-parser
 python -m venv venv
-venv\Scripts\activate  # On Windows
+venv\Scripts\activate.bat  # On Windows
 pip install -r requirements.txt
 python main.py
 ```
