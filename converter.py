@@ -917,7 +917,7 @@ class PageProcessor:
         blocks = page.get_text("blocks")
         words = page.get_text(
             "words",
-            flags=pymupdf.TEXTFLAGS_WORDS | pymupdf.TEXT_INHIBIT_SPACES
+            flags=pymupdf.TEXTFLAGS_WORDS # to agressive | pymupdf.TEXT_INHIBIT_SPACES
         )        
         if not blocks or not words:
             return blocks
